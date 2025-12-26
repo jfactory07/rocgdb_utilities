@@ -10,7 +10,7 @@ This script parses Tensile AMDGPU assembly (`.s`) **at the current stop location
 Source once per debug session:
 
 ```gdb
-source rocgdb_utilities/rocgdb_autogen.gdb
+source rocgdb_utilities/rocgdb.gdb
 ```
 
 That’s it.
@@ -55,7 +55,7 @@ p/x $vgprGlobalReadOffsetB_11
 Add this to `setupCommands` so the script is always available:
 
 ```json
-{ "text": "source rocgdb_utilities/rocgdb_autogen.gdb" }
+{ "text": "source rocgdb_utilities/rocgdb.gdb" }
 ```
 
 

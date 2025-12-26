@@ -3,7 +3,7 @@
 Source once per debug session:
 
 ```gdb
-source rocgdb_utilities/rocgdb_utilities.gdb
+source rocgdb_utilities/rocgdb.gdb
 ```
 
 ### VSCode setup (`launch.json`)
@@ -13,7 +13,7 @@ Add this to your `setupCommands` so VSCode/ROCgdb loads the commands automatical
 ```json
 {
   "setupCommands": [
-    { "text": "source rocgdb_utilities/rocgdb_utilities.gdb" }
+    { "text": "source rocgdb_utilities/rocgdb.gdb" }
   ]
 }
 ```
