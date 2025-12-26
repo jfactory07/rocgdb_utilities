@@ -39,5 +39,6 @@ Add these entries to your `setupCommands`:
 # source src/rocgdb_utilities.gdb
 ```
 
-<img width="474" height="295" alt="image" src="https://github.com/user-attachments/assets/c4ed3fc3-b598-4c4c-98e0-5ae52c4ece53" />
+<img width="1257" height="171" alt="image" src="https://github.com/user-attachments/assets/6caef83d-c1ab-4790-9773-64a321594971" />
+
 
