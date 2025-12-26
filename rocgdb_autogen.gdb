@@ -7,7 +7,7 @@
 #   variables exist and refresh on every stop.
 #
 # Usage:
-#   (gdb) source /mnt/rocm-libraries-dev/rocm-libraries/projects/hipblaslt/utilities/rocgdb/rocgdb_autogen.gdb
+#   (gdb) source rocgdb_utilities/rocgdb_autogen.gdb
 #   (gdb) roc_autogen_enable            # default: inline parser (no external script needed)
 #
 # Commands:

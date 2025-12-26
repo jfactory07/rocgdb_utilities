@@ -3,7 +3,7 @@
 Source once per debug session:
 
 ```gdb
-source /mnt/rocm-libraries-dev/rocm-libraries/projects/hipblaslt/utilities/rocgdb/rocgdb_utilities.gdb
+source rocgdb_utilities/rocgdb_utilities.gdb
 ```
 
 ### LDS / Global memory dump helpers

@@ -1,7 +1,7 @@
 # Common ROCgdb/GDB helpers (source this file once per debug session)
 #
 # Usage:
-#   (gdb) source /mnt/rocm-libraries-dev/rocm-libraries/projects/hipblaslt/utilities/rocgdb/rocgdb_utilities.gdb
+#   (gdb) source rocgdb_utilities/rocgdb_utilities.gdb
 #
 # Commands provided:
 #   - reg <expr> [--max-cu N] [--cu ID]... [--hex|--dec] [--fp16|--bf16|--fp32] [--lane N] [--show-err]
