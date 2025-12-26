@@ -279,7 +279,7 @@ def _format_lanes_chunks(v, out_hex=True, per_line=16):
 
 
 class RegCommand(gdb.Command):
-    """reg <expr> [--max-cu N] [--cu ID]... [--hex|--dec] [--fp16|--bf16|--fp32] [--lane N] [--show-err]
+    """reg <expr> [--max-cu N] [--cu ID]... [--wave W|W0-W1|W0,W1,...] [--hex|--dec] [--fp16|--bf16|--fp32] [--lane N] [--show-err]
 
 Print a 4-column grid. Each row corresponds to one CU, and each column is one wave.
 This uses thread ordering as a proxy for CU assignment:
@@ -294,7 +294,7 @@ This uses thread ordering as a proxy for CU assignment:
         out_path, argv = _parse_out_arg(argv)
         wout = _TeeWriter(out_path)
         if not argv:
-            wout.write("Usage: reg <expr> [--max-cu N] [--cu ID]... [--hex|--dec] [--fp16|--bf16|--fp32] [--lane N] [--show-err] [--debug] [--escape] [--out PATH]\n")
+            wout.write("Usage: reg <expr> [--max-cu N] [--cu ID]... [--wave W|W0-W1|W0,W1,...] [--hex|--dec] [--fp16|--bf16|--fp32] [--lane N] [--show-err] [--debug] [--escape] [--out PATH]\n")
             wout.close()
             return
 
@@ -311,6 +311,7 @@ This uses thread ordering as a proxy for CU assignment:
         debug = False
         escape = False
         float_mode = None
+        wave_cols = [0, 1, 2, 3]  # which wave columns to print (W0..W3)
 
         i = 1
         while i < len(argv):
@@ -365,6 +366,43 @@ This uses thread ordering as a proxy for CU assignment:
                         lane_hi = None
                 except Exception:
                     raise gdb.GdbError(f"reg: invalid --lane value: {s} (use N or LO-HI)")
+                i += 2
+                continue
+            if a == "--wave" and i + 1 < len(argv):
+                s = argv[i + 1]
+                picked = []
+
+                def _add_w(v: int):
+                    if v < 0 or v > 3:
+                        raise ValueError("wave out of range")
+                    if v not in picked:
+                        picked.append(v)
+
+                try:
+                    # Accept:
+                    #   --wave 2
+                    #   --wave 0-3
+                    #   --wave 0,2,3
+                    for part in s.split(","):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        if "-" in part:
+                            lo_s, hi_s = part.split("-", 1)
+                            lo = int(lo_s, 0)
+                            hi = int(hi_s, 0)
+                            if hi < lo:
+                                raise ValueError("wave range hi < lo")
+                            for v in range(lo, hi + 1):
+                                _add_w(v)
+                        else:
+                            _add_w(int(part, 0))
+                except Exception:
+                    raise gdb.GdbError(f"reg: invalid --wave value: {s} (use W, LO-HI, or comma list; W in 0..3)")
+
+                if not picked:
+                    raise gdb.GdbError("reg: --wave requires at least one wave index (0..3)")
+                wave_cols = picked
                 i += 2
                 continue
             if a == "--show-err":
@@ -616,7 +654,7 @@ This uses thread ordering as a proxy for CU assignment:
             wout.write("--  --  -----\n")
             for cu in cu_list:
                 cols = cu_to_cols.get(cu, [None, None, None, None])
-                for w in range(4):
+                for w in wave_cols:
                     captured = cols[w]
                     if captured is None:
                         wout.write(f"{cu:<3d} W{w} NA\n")
@@ -650,7 +688,8 @@ This uses thread ordering as a proxy for CU assignment:
             entries = []  # list[(cu:int, val:str)]
             for cu, r in rows:
                 v = "NA"
-                for c in r:
+                for wi in wave_cols:
+                    c = r[wi]
                     if c != "NA":
                         v = c
                         break
@@ -667,16 +706,28 @@ This uses thread ordering as a proxy for CU assignment:
             return
 
         w0 = max(len("CU"), max(len(str(cu)) for cu in cu_list))
-        col_w = [len("W0"), len("W1"), len("W2"), len("W3")]
+        headers = [f"W{w}" for w in wave_cols]
+        col_w = [len(h) for h in headers]
         for _cu, r in rows:
-            for j in range(4):
-                col_w[j] = max(col_w[j], len(r[j]))
+            for j, wi in enumerate(wave_cols):
+                col_w[j] = max(col_w[j], len(r[wi]))
 
-        wout.write(_pad("CU", w0) + "  " + _pad("W0", col_w[0]) + "  " + _pad("W1", col_w[1]) + "  " + _pad("W2", col_w[2]) + "  " + _pad("W3", col_w[3]) + "\n")
-        wout.write(_pad("-" * w0, w0) + "  " + _pad("-" * col_w[0], col_w[0]) + "  " + _pad("-" * col_w[1], col_w[1]) + "  " + _pad("-" * col_w[2], col_w[2]) + "  " + _pad("-" * col_w[3], col_w[3]) + "\n")
+        # Header
+        line = _pad("CU", w0)
+        for j, h in enumerate(headers):
+            line += "  " + _pad(h, col_w[j])
+        wout.write(line + "\n")
+        line = _pad("-" * w0, w0)
+        for j in range(len(headers)):
+            line += "  " + _pad("-" * col_w[j], col_w[j])
+        wout.write(line + "\n")
 
+        # Rows
         for cu, r in rows:
-            wout.write(_pad(str(cu), w0) + "  " + _pad(r[0], col_w[0]) + "  " + _pad(r[1], col_w[1]) + "  " + _pad(r[2], col_w[2]) + "  " + _pad(r[3], col_w[3]) + "\n")
+            line = _pad(str(cu), w0)
+            for j, wi in enumerate(wave_cols):
+                line += "  " + _pad(r[wi], col_w[j])
+            wout.write(line + "\n")
         wout.close()
 
 

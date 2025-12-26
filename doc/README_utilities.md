@@ -106,6 +106,9 @@ reg $v192 --max-cu 1 --dec --show-err # show error messages for ERR cells
 reg $v192 --max-cu 1 --fp32           # interpret each 32b lane as 1x fp32
 reg $v192 --max-cu 1 --fp16           # interpret each 32b lane as 2x fp16 (lo16,hi16)
 reg $v192 --max-cu 1 --bf16           # interpret each 32b lane as 2x bf16 (lo16,hi16)
+reg $v192 --bf16 --wave 2             # only show W2 per CU
+reg $v192 --bf16 --wave 0,3           # only show W0 and W3
+reg $v192 --bf16 --wave 1-2           # only show W1 and W2
 ```
 
 ### Switch to a specific CU wave (`swcu`)
