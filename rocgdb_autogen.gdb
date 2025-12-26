@@ -15,8 +15,9 @@
 #   - roc_autogen_enable [--force]
 #
 # Notes:
-#   - This caches per-asm file: it only regenerates when you stop at a *later*
-#     line than previously seen (or when the asm file changed).
+#   - This caches per-asm file: it regenerates when the asm file changed (or when forced).
+#   - It parses the **entire** `.s` file, so `reg --map` includes all `.set` symbols,
+#     not just those before the current stop location.
 #
 
 python
@@ -39,7 +40,7 @@ def _strip_comment(line: str) -> str:
     return line.strip()
 
 
-def _parse_defs_uses_ranges(asm_path: str, upto_line: int):
+def _parse_defs_uses_ranges(asm_path: str):
     defs = {}          # name -> expr string
     v_uses = set()     # (name, off)
     s_uses = set()     # (name, off)
@@ -47,8 +48,6 @@ def _parse_defs_uses_ranges(asm_path: str, upto_line: int):
 
     with open(asm_path, "r", encoding="utf-8", errors="replace") as f:
         for ln, raw in enumerate(f, start=1):
-            if upto_line is not None and ln > upto_line:
-                break
             line = _strip_comment(raw)
             if not line:
                 continue
@@ -56,6 +55,11 @@ def _parse_defs_uses_ranges(asm_path: str, upto_line: int):
             m = _SET_RE.match(line)
             if m:
                 name, expr = m.group(1), m.group(2).strip()
+                # Tensile often "undefines" symbols at the end via:
+                #   .set sgprFoo, UNDEF
+                # Keep the last *meaningful* definition so the symbol map remains useful.
+                if expr.upper() == "UNDEF":
+                    continue
                 defs[name] = expr
                 continue
 
@@ -227,8 +231,8 @@ def _gdb_define_roc_update(resolved: dict, v_uses: set, s_uses: set, ranges: set
     gdb.execute("\n".join(lines), to_string=True)
 
 
-def _roc_autogen_inline(asm_path: str, upto_line: int):
-    defs, v_uses, s_uses, ranges = _parse_defs_uses_ranges(asm_path, upto_line)
+def _roc_autogen_inline(asm_path: str):
+    defs, v_uses, s_uses, ranges = _parse_defs_uses_ranges(asm_path)
     resolved = _resolve_all(defs)
     _gdb_define_roc_update(resolved, v_uses, s_uses, ranges)
     # refresh immediately
@@ -262,7 +266,7 @@ def _roc_current_asm_and_line():
 
 _roc_autogen_state = {
     "in_progress": False,
-    # asm_path -> {"mtime": float, "max_line": int}
+    # asm_path -> {"mtime": float}
     "cache": {},
 }
 
@@ -307,10 +311,8 @@ class RocAutogenCommand(gdb.Command):
         if cache is None:
             need = True
         else:
-            # Regenerate if asm changed or we advanced to a later line.
+            # Regenerate if asm changed.
             if cache.get("mtime") != mtime:
-                need = True
-            if int(line) > int(cache.get("max_line", -1)):
                 need = True
 
         if not need:
@@ -323,10 +325,9 @@ class RocAutogenCommand(gdb.Command):
 
         _roc_autogen_state["in_progress"] = True
         try:
-            _roc_autogen_inline(asm_path=asm, upto_line=int(line))
+            _roc_autogen_inline(asm_path=asm)
             _roc_autogen_state["cache"][asm] = {
                 "mtime": mtime,
-                "max_line": int(line),
             }
         finally:
             _roc_autogen_state["in_progress"] = False
