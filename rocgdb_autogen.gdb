@@ -31,6 +31,31 @@ _V_USE_RE = re.compile(r"v\[\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\+\s*([0-9]+))?\s*\
 _S_USE_RE = re.compile(r"s\[\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\+\s*([0-9]+))?\s*\]")
 _V_RANGE_RE = re.compile(r"v\[\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*\1\s*\+\s*([0-9]+)\s*\]")
 _S_RANGE_RE = re.compile(r"s\[\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*\1\s*\+\s*([0-9]+)\s*\]")
+_V_RANGE_EXPR_RE = re.compile(r"v\[\s*([^:\]]+?)\s*:\s*([^\]]+?)\s*\]")
+_S_RANGE_EXPR_RE = re.compile(r"s\[\s*([^:\]]+?)\s*:\s*([^\]]+?)\s*\]")
+
+
+def _sum_int_terms(expr_tail: str) -> int:
+    """Sum integer literals appearing in a suffix like '+4+0+0+3' (supports hex)."""
+    s = 0
+    for tok in re.findall(r"0x[0-9a-fA-F]+|\d+", expr_tail):
+        try:
+            s += int(tok, 0)
+        except Exception:
+            pass
+    return s
+
+
+def _split_base_and_tail(expr: str):
+    """
+    For a simple register expression like:
+      'vgprFoo+4+0' -> ('vgprFoo', '+4+0')
+    Returns (base, tail) or (None, None).
+    """
+    m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(.*)$", expr.strip())
+    if not m:
+        return None, None
+    return m.group(1), m.group(2) or ""
 
 
 def _strip_comment(line: str) -> str:
@@ -82,6 +107,28 @@ def _parse_defs_uses_ranges(asm_path: str):
                 n = mm.group(1)
                 k = int(mm.group(2))
                 ranges.add(("s", n, 0, k))
+
+            # Ranges with explicit offsets (common in Tensile asm), e.g.:
+            #   v[vgprValuA_X0_I0+4 : vgprValuA_X0_I0+4+3]
+            #   s[sgprSrdA+0 : sgprSrdA+0+3]
+            for mm in _V_RANGE_EXPR_RE.finditer(line):
+                a, b = mm.group(1), mm.group(2)
+                abase, atail = _split_base_and_tail(a)
+                bbase, btail = _split_base_and_tail(b)
+                if abase and bbase and abase == bbase:
+                    lo = _sum_int_terms(atail)
+                    hi = _sum_int_terms(btail)
+                    if hi >= lo:
+                        ranges.add(("v", abase, lo, hi))
+            for mm in _S_RANGE_EXPR_RE.finditer(line):
+                a, b = mm.group(1), mm.group(2)
+                abase, atail = _split_base_and_tail(a)
+                bbase, btail = _split_base_and_tail(b)
+                if abase and bbase and abase == bbase:
+                    lo = _sum_int_terms(atail)
+                    hi = _sum_int_terms(btail)
+                    if hi >= lo:
+                        ranges.add(("s", abase, lo, hi))
 
     return defs, v_uses, s_uses, ranges
 
