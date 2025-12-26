@@ -32,6 +32,15 @@ roc_autogen_enable
 roc_autogen --force
 ```
 
+- **Full-file mode (optional)**:
+  Tensile sometimes redefines `.set` symbols later in the file (e.g. resetting offsets).
+  Default behavior is stop-line-aware; if you want the “last definition in the file” view:
+
+```gdb
+roc_autogen --full
+roc_autogen_enable --full
+```
+
 ### Using the variables
 
 Once you stop inside a Tensile `.s` frame:

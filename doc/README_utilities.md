@@ -93,6 +93,9 @@ reg v192 --cu 255
 reg sgprWorkGroup0 --cu 0 --out /tmp/reg.txt
 ```
 
+If you also source `rocgdb_utilities/rocgdb_autogen.gdb`, `reg` will automatically refresh the autogen map
+for the **current stop location** before evaluating register names.
+
 Shorthand for indexed registers:
 
 - `sgprFoo+1` is treated as `sgprFoo_1` (i.e. register index +1), so `reg sgprSrdA+1` maps to `$s{sgprSrdA+1}`.

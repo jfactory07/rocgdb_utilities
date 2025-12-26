@@ -24,6 +24,43 @@ import re
 import os
 
 
+def _in_tensile_asm_frame() -> bool:
+    """Best-effort check: are we currently stopped in a Tensile `.s` frame?"""
+    try:
+        fr = gdb.newest_frame()
+        if fr is None:
+            return False
+        sal = fr.find_sal()
+        if sal is None or sal.symtab is None:
+            return False
+        try:
+            fn = sal.symtab.fullname()
+        except Exception:
+            fn = sal.symtab.filename
+        if not fn:
+            return False
+        return str(fn).endswith(".s")
+    except Exception:
+        return False
+
+
+def _refresh_autogen_map_if_needed():
+    """
+    If `rocgdb_autogen.gdb` is loaded, refresh its symbol->register map for the
+    current stop location.
+
+    This keeps `reg`/`global` evaluations consistent with stop-line-aware `.set`
+    redefinitions (e.g. symbols that get reset later in the file).
+    """
+    try:
+        if not _in_tensile_asm_frame():
+            return
+        # roc_autogen is defined by rocgdb_autogen.gdb; ignore if not present.
+        gdb.execute("roc_autogen", to_string=True)
+    except Exception:
+        pass
+
+
 def _rewrite_expr_via_autogen_map(expr: str) -> str:
     """
     If rocgdb_autogen.gdb is loaded, it exports `gdb._roc_autogen_sym2reg`
@@ -372,6 +409,9 @@ This uses thread ordering as a proxy for CU assignment:
             wout.write("       reg --map [--out PATH]\n")
             wout.close()
             return
+
+        # If autogen is loaded, refresh its map for this stop location.
+        _refresh_autogen_map_if_needed()
 
         # Print the autogen symbol->register table, if available.
         if len(argv) == 1 and argv[0] == "--map":
@@ -1064,6 +1104,7 @@ class _LdsCmd(gdb.Command):
         argv = gdb.string_to_argv(arg)
         out_path, argv = _parse_out_arg(argv)
         wout = _TeeWriter(out_path)
+        _refresh_autogen_map_if_needed()
         if len(argv) == 0:
             wout.write("Usage: lds <offset> [count] [hex|fp16|bf16|fp32] [--out PATH]\n")
             wout.close()
@@ -1127,6 +1168,7 @@ class _GlobalCmd(gdb.Command):
         argv = gdb.string_to_argv(arg)
         out_path, argv = _parse_out_arg(argv)
         wout = _TeeWriter(out_path)
+        _refresh_autogen_map_if_needed()
         if len(argv) == 0:
             wout.write("Usage: global <addr-expr> [count] [hex|fp16|bf16|fp32] [--out PATH]\n")
             wout.write("   or: global <addr-lo-expr> <addr-hi-expr> [count] [hex|fp16|bf16|fp32] [--out PATH]\n")

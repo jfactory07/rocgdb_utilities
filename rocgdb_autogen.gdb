@@ -318,7 +318,7 @@ def _roc_current_asm_and_line():
 
 _roc_autogen_state = {
     "in_progress": False,
-    # asm_path -> {"mtime": float, "mode": "upto"|"full", "max_line": int}
+    # asm_path -> {"mtime": float, "mode": "upto"|"full", "line": int}
     "cache": {},
 }
 
@@ -373,7 +373,9 @@ class RocAutogenCommand(gdb.Command):
                 need = True
             if cache.get("mode") != mode:
                 need = True
-            if mode == "upto" and int(line) > int(cache.get("max_line", -1)):
+            # In stop-line-aware mode we must regenerate if the stop line changes
+            # (you can jump backwards and the meaning of `.set` symbols can change).
+            if mode == "upto" and int(line) != int(cache.get("line", -1)):
                 need = True
 
         if not need:
@@ -390,7 +392,7 @@ class RocAutogenCommand(gdb.Command):
             _roc_autogen_state["cache"][asm] = {
                 "mtime": mtime,
                 "mode": mode,
-                "max_line": int(line) if not full else -1,
+                "line": int(line) if not full else -1,
             }
         finally:
             _roc_autogen_state["in_progress"] = False
