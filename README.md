@@ -9,6 +9,25 @@ This folder contains ROCgdb helper scripts to make Tensile AMDGPU assembly debug
 
 ### Quick start (source two scripts)
 
+#### VSCode (`launch.json`)
+
+Add these entries to your `setupCommands`:
+
+```json
+{
+  "description": "ROCgdb autogen (.set → register map) + utilities (reg/lds/global/swcu)",
+  "text": "source ${workspaceFolder}/utilities/rocgdb_utilities/src/rocgdb_autogen.gdb",
+  "ignoreFailures": false
+},
+{
+  "description": "ROCgdb utilities (reg/lds/global/swcu)",
+  "text": "source ${workspaceFolder}/utilities/rocgdb_utilities/src/rocgdb_utilities.gdb",
+  "ignoreFailures": false
+}
+```
+
+#### ROCgdb (manual)
+
 ```gdb
 # If you are in hipblaslt workspace root:
 source utilities/rocgdb_utilities/src/rocgdb_autogen.gdb
