@@ -1,12 +1,15 @@
-# ROCgdb entrypoint (single-source convenience)
 #
-# This file just sources the two scripts in this folder so you only need:
-#   (gdb) source rocgdb_utilities/rocgdb.gdb
+# Convenience wrapper for when your GDB `pwd` is the `rocgdb_utilities` repo root:
 #
-# Note: paths are relative to your current working directory in gdb.
-# We intentionally keep them as `rocgdb_utilities/...` for portability.
+#   (gdb) pwd
+#   .../rocgdb_utilities
+#   (gdb) source rocgdb.gdb
+#
+# If you are not in this repo root (e.g. you are in hipblaslt workspace root),
+# prefer sourcing the two scripts via absolute paths (VSCode `${workspaceFolder}`
+# is perfect for that).
 
-source rocgdb_utilities/src/rocgdb_autogen.gdb
-source rocgdb_utilities/src/rocgdb_utilities.gdb
+source src/rocgdb_autogen.gdb
+source src/rocgdb_utilities.gdb
 
 

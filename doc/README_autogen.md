@@ -10,10 +10,8 @@ This script parses Tensile AMDGPU assembly (`.s`) **at the current stop location
 Source once per debug session:
 
 ```gdb
-source rocgdb_utilities/rocgdb.gdb
+source rocgdb_utilities/src/rocgdb_autogen.gdb
 ```
-
-That’s it.
 
 - The file installs a **one-shot** stop handler: on the *first* stop after sourcing, it enables auto-generation for subsequent stops.
 - Auto-generation uses `gdb.events.stop` (so it does **not** conflict with VSCode’s own `hook-stop` usage).
@@ -55,7 +53,7 @@ p/x $vgprGlobalReadOffsetB_11
 Add this to `setupCommands` so the script is always available:
 
 ```json
-{ "text": "source rocgdb_utilities/rocgdb.gdb" }
+{ "text": "source rocgdb_utilities/src/rocgdb_autogen.gdb" }
 ```
 
 
