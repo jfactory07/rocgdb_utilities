@@ -398,7 +398,8 @@ This uses thread ordering as a proxy for CU assignment:
     """
 
     def __init__(self):
-        super().__init__("reg", gdb.COMMAND_DATA)
+        # Use COMMAND_USER so it shows up under `help user-defined`.
+        super().__init__("reg", gdb.COMMAND_USER)
 
     def invoke(self, arg, from_tty):
         argv = gdb.string_to_argv(arg)
@@ -1100,7 +1101,8 @@ class _LdsCmd(gdb.Command):
     """Dump LDS (local address space): lds <offset> [count] [hex|fp16|bf16|fp32] [--out PATH]"""
 
     def __init__(self):
-        super().__init__("lds", gdb.COMMAND_DATA)
+        # Use COMMAND_USER so it shows up under `help user-defined`.
+        super().__init__("lds", gdb.COMMAND_USER)
 
     def invoke(self, arg, from_tty):
         argv = gdb.string_to_argv(arg)
@@ -1164,7 +1166,8 @@ class _GlobalCmd(gdb.Command):
 """
 
     def __init__(self):
-        super().__init__("global", gdb.COMMAND_DATA)
+        # Use COMMAND_USER so it shows up under `help user-defined`.
+        super().__init__("global", gdb.COMMAND_USER)
 
     def invoke(self, arg, from_tty):
         argv = gdb.string_to_argv(arg)
