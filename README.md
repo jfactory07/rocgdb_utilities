@@ -44,7 +44,6 @@ Add these entries to your `setupCommands`:
 After sourcing, you should see these commands under `help user-defined`:
 
 ```text
-help user-defined
 User-defined commands.
 The commands in this class are those defined by the user.
 Use the "define" command to define a command.
@@ -64,6 +63,8 @@ Type "apropos word" to search for commands related to "word".
 Type "apropos -v word" for full documentation of commands related to "word".
 Command name abbreviations are allowed if unambiguous.
 ```
+
+Screenshot: output of `reg` after the scripts are sourced successfully.
 
 <img width="1257" height="171" alt="image" src="https://github.com/user-attachments/assets/6caef83d-c1ab-4790-9773-64a321594971" />
 
