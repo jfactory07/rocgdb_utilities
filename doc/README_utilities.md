@@ -87,9 +87,9 @@ Examples:
 
 ```gdb
 reg sgprWorkGroup0
-reg sgprWorkGroup0 --max-cu 32 --dec
-reg sgprWorkGroup0 --cu 255 --dec
-reg v192 --cu 255 --dec
+reg sgprWorkGroup0 --max-cu 32
+reg sgprWorkGroup0 --cu 255
+reg v192 --cu 255
 reg sgprWorkGroup0 --cu 0 --out /tmp/reg.txt
 ```
 

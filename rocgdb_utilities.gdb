@@ -8,6 +8,7 @@
 #           [--debug] [--escape] [--out PATH]
 #       Dump register values in a CU/wave table. For VGPRs, default prints all lanes (16 per line).
 #       You can omit the leading '$' for register-like tokens (e.g. `reg sgprWorkGroup0`, `reg v192`).
+#       For SGPR/VGPR ($sgpr*/$vgpr*/$sN/$vN), default is decimal integer output (use --hex to override).
 #
 #   - lds <offset> [count] [hex|fp16|bf16|fp32] [--out PATH]
 #       Dump LDS (local address space) with optional decoding.
@@ -392,7 +393,14 @@ This uses thread ordering as a proxy for CU assignment:
         eval_expr = _rewrite_expr_via_autogen_map(expr)
         max_cu = None
         cu_filter = []  # list[int], if non-empty only show these CUs (in given order)
-        out_hex = True
+        # Default formatting:
+        # - For register-like expressions ($sgpr*/$vgpr*/$sN/$vN), default to decimal integers.
+        # - For other expressions, default to hex (useful for pointers/addresses).
+        is_reg_like = (
+            re.match(r"^\$(?:[sv]\d+)$", eval_expr) is not None
+            or re.match(r"^\$(?:sgpr|vgpr)[A-Za-z_][A-Za-z0-9_]*(?:_[0-9]+)?$", expr) is not None
+        )
+        out_hex = (not is_reg_like)
         # If expr is a VGPR (vector register), default is to print ALL lanes.
         # Use --lane N to select a single lane.
         lane_idx = None
