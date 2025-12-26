@@ -418,7 +418,9 @@ This uses thread ordering as a proxy for CU assignment:
             sym2reg = getattr(gdb, "_roc_autogen_sym2reg", None)
             if not isinstance(sym2reg, dict) or not sym2reg:
                 wout.write("reg --map: no autogen table found.\n")
-                wout.write("Hint: source `rocgdb_utilities/src/rocgdb_autogen.gdb` and run `roc_autogen`/`roc_update` once.\n")
+                wout.write("Hint: source the autogen script and run `roc_autogen`/`roc_update` once.\n")
+                wout.write("  - hipblaslt workspace root: `source utilities/rocgdb_utilities/src/rocgdb_autogen.gdb`\n")
+                wout.write("  - rocgdb_utilities repo root: `source src/rocgdb_autogen.gdb`\n")
                 wout.close()
                 return
 

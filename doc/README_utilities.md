@@ -3,8 +3,13 @@
 Source once per debug session:
 
 ```gdb
-source rocgdb_utilities/src/rocgdb_autogen.gdb
-source rocgdb_utilities/src/rocgdb_utilities.gdb
+# hipblaslt workspace root:
+source utilities/rocgdb_utilities/src/rocgdb_autogen.gdb
+source utilities/rocgdb_utilities/src/rocgdb_utilities.gdb
+
+# rocgdb_utilities repo root:
+# source src/rocgdb_autogen.gdb
+# source src/rocgdb_utilities.gdb
 ```
 
 ### VSCode setup (`launch.json`)
@@ -14,8 +19,8 @@ Add this to your `setupCommands` so VSCode/ROCgdb loads the commands automatical
 ```json
 {
   "setupCommands": [
-    { "text": "source rocgdb_utilities/src/rocgdb_autogen.gdb" },
-    { "text": "source rocgdb_utilities/src/rocgdb_utilities.gdb" }
+    { "text": "source ${workspaceFolder}/utilities/rocgdb_utilities/src/rocgdb_autogen.gdb" },
+    { "text": "source ${workspaceFolder}/utilities/rocgdb_utilities/src/rocgdb_utilities.gdb" }
   ]
 }
 ```

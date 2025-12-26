@@ -10,7 +10,11 @@ This script parses Tensile AMDGPU assembly (`.s`) **at the current stop location
 Source once per debug session:
 
 ```gdb
-source rocgdb_utilities/src/rocgdb_autogen.gdb
+# hipblaslt workspace root:
+source utilities/rocgdb_utilities/src/rocgdb_autogen.gdb
+
+# rocgdb_utilities repo root:
+# source src/rocgdb_autogen.gdb
 ```
 
 - The file installs a **one-shot** stop handler: on the *first* stop after sourcing, it enables auto-generation for subsequent stops.
@@ -53,7 +57,7 @@ p/x $vgprGlobalReadOffsetB_11
 Add this to `setupCommands` so the script is always available:
 
 ```json
-{ "text": "source rocgdb_utilities/src/rocgdb_autogen.gdb" }
+{ "text": "source ${workspaceFolder}/utilities/rocgdb_utilities/src/rocgdb_autogen.gdb" }
 ```
 
 
