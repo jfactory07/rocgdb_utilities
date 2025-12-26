@@ -307,6 +307,7 @@ def _format_lanes_chunks(v, out_hex=True, per_line=16):
 
 class RegCommand(gdb.Command):
     """reg <expr> [--max-cu N] [--cu ID]... [--wave W|W0-W1|W0,W1,...] [--hex|--dec] [--fp16|--bf16|--fp32] [--lane N] [--show-err]
+       reg --map
 
 Print a 4-column grid. Each row corresponds to one CU, and each column is one wave.
 This uses thread ordering as a proxy for CU assignment:
@@ -322,6 +323,39 @@ This uses thread ordering as a proxy for CU assignment:
         wout = _TeeWriter(out_path)
         if not argv:
             wout.write("Usage: reg <expr> [--max-cu N] [--cu ID]... [--wave W|W0-W1|W0,W1,...] [--hex|--dec] [--fp16|--bf16|--fp32] [--lane N] [--show-err] [--debug] [--escape] [--out PATH]\n")
+            wout.write("       reg --map [--out PATH]\n")
+            wout.close()
+            return
+
+        # Print the autogen symbol->register table, if available.
+        if len(argv) == 1 and argv[0] == "--map":
+            sym2reg = getattr(gdb, "_roc_autogen_sym2reg", None)
+            if not isinstance(sym2reg, dict) or not sym2reg:
+                wout.write("reg --map: no autogen table found.\n")
+                wout.write("Hint: source `rocgdb_utilities/rocgdb_autogen.gdb` and run `roc_autogen`/`roc_update` once.\n")
+                wout.close()
+                return
+
+            rows = []
+            for name, kv in sym2reg.items():
+                try:
+                    kind, idx = kv[0], int(kv[1])
+                    reg = f"$s{idx}" if kind == "s" else (f"$v{idx}" if kind == "v" else "?")
+                    rows.append((str(name), str(kind), str(idx), reg))
+                except Exception:
+                    rows.append((str(name), "?", "?", "?"))
+
+            rows.sort(key=lambda x: x[0])
+            w_name = max(len("name"), max(len(r[0]) for r in rows))
+            w_kind = max(len("k"), 1)
+            w_idx = max(len("idx"), max(len(r[2]) for r in rows))
+            w_reg = max(len("reg"), max(len(r[3]) for r in rows))
+
+            wout.write("reg: autogen symbol table (gdb._roc_autogen_sym2reg)\n")
+            wout.write(_pad("name", w_name) + "  " + _pad("k", w_kind) + "  " + _pad("idx", w_idx) + "  " + _pad("reg", w_reg) + "\n")
+            wout.write(_pad("-" * w_name, w_name) + "  " + _pad("-" * w_kind, w_kind) + "  " + _pad("-" * w_idx, w_idx) + "  " + _pad("-" * w_reg, w_reg) + "\n")
+            for n, k, i, r in rows:
+                wout.write(_pad(n, w_name) + "  " + _pad(k, w_kind) + "  " + _pad(i, w_idx) + "  " + _pad(r, w_reg) + "\n")
             wout.close()
             return
 

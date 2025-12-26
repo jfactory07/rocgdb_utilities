@@ -111,6 +111,16 @@ reg $v192 --bf16 --wave 0,3           # only show W0 and W3
 reg $v192 --bf16 --wave 1-2           # only show W1 and W2
 ```
 
+### Print autogen symbol table (`reg --map`)
+
+If you also source `rocgdb_utilities/rocgdb_autogen.gdb`, it exports a symbol→register mapping table.
+You can print it to verify mappings like `sgprWorkGroup0 -> $sNN`:
+
+```gdb
+reg --map
+reg --map --out /tmp/rocgdb_map.txt
+```
+
 ### Switch to a specific CU wave (`swcu`)
 
 Quickly switch the selected GPU wave to a specific CU:
