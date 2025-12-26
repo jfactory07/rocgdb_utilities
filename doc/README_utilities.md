@@ -93,7 +93,7 @@ reg v192 --cu 255
 reg sgprWorkGroup0 --cu 0 --out /tmp/reg.txt
 ```
 
-If you also source `rocgdb_utilities/rocgdb_autogen.gdb`, `reg` will automatically refresh the autogen map
+If you also source `rocgdb_utilities/src/rocgdb_autogen.gdb`, `reg` will automatically refresh the autogen map
 for the **current stop location** before evaluating register names.
 
 Shorthand for indexed registers:
@@ -121,7 +121,7 @@ reg $v192 --bf16 --wave 1-2           # only show W1 and W2
 
 ### Print autogen symbol table (`reg --map`)
 
-If you also source `rocgdb_utilities/rocgdb_autogen.gdb`, it exports a symbol→register mapping table.
+If you also source `rocgdb_utilities/src/rocgdb_autogen.gdb`, it exports a symbol→register mapping table.
 You can print it to verify mappings like `sgprWorkGroup0 -> $sNN`:
 
 ```gdb

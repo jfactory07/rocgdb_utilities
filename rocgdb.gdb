@@ -6,7 +6,7 @@
 # Note: paths are relative to your current working directory in gdb.
 # We intentionally keep them as `rocgdb_utilities/...` for portability.
 
-source rocgdb_utilities/rocgdb_autogen.gdb
-source rocgdb_utilities/rocgdb_utilities.gdb
+source rocgdb_utilities/src/rocgdb_autogen.gdb
+source rocgdb_utilities/src/rocgdb_utilities.gdb
 
 
