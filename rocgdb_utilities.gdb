@@ -7,6 +7,7 @@
 #   - reg <expr> [--max-cu N] [--cu ID]... [--hex|--dec] [--fp16|--bf16|--fp32] [--lane N] [--show-err]
 #           [--debug] [--escape] [--out PATH]
 #       Dump register values in a CU/wave table. For VGPRs, default prints all lanes (16 per line).
+#       You can omit the leading '$' for register-like tokens (e.g. `reg sgprWorkGroup0`, `reg v192`).
 #
 #   - lds <offset> [count] [hex|fp16|bf16|fp32] [--out PATH]
 #       Dump LDS (local address space) with optional decoding.
@@ -44,6 +45,34 @@ def _rewrite_expr_via_autogen_map(expr: str) -> str:
             return f"$s{idx}"
         if kind == "v":
             return f"$v{idx}"
+        return expr
+    except Exception:
+        return expr
+
+
+def _normalize_reg_expr(expr: str) -> str:
+    """
+    Allow users to omit the leading '$' when passing a register-like token:
+      - sgprFoo / vgprBar / sgprFoo_3 / vgprBar_12
+      - sN / vN
+    Also, if rocgdb_autogen.gdb is loaded, accept any autogen symbol name in
+    gdb._roc_autogen_sym2reg without '$'.
+    """
+    try:
+        if not expr:
+            return expr
+        if expr.startswith("$"):
+            return expr
+
+        # If autogen map is present, accept bare symbol names.
+        sym2reg = getattr(gdb, "_roc_autogen_sym2reg", None)
+        if isinstance(sym2reg, dict) and expr in sym2reg:
+            return "$" + expr
+
+        if re.match(r"^(sgpr|vgpr)[A-Za-z_][A-Za-z0-9_]*(?:_[0-9]+)?$", expr):
+            return "$" + expr
+        if re.match(r"^[sv][0-9]+$", expr):
+            return "$" + expr
         return expr
     except Exception:
         return expr
@@ -359,7 +388,7 @@ This uses thread ordering as a proxy for CU assignment:
             wout.close()
             return
 
-        expr = argv[0]
+        expr = _normalize_reg_expr(argv[0])
         eval_expr = _rewrite_expr_via_autogen_map(expr)
         max_cu = None
         cu_filter = []  # list[int], if non-empty only show these CUs (in given order)

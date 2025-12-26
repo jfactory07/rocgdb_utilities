@@ -86,11 +86,11 @@ If your run maps **4 waves per CU**, ROCgdb `info threads` output includes the C
 Examples:
 
 ```gdb
-reg $sgprWorkGroup0
-reg $sgprWorkGroup0 --max-cu 32 --dec
-reg $sgprWorkGroup0 --cu 255 --dec
-reg $v192 --cu 255 --dec
-reg $sgprWorkGroup0 --cu 0 --out /tmp/reg.txt
+reg sgprWorkGroup0
+reg sgprWorkGroup0 --max-cu 32 --dec
+reg sgprWorkGroup0 --cu 255 --dec
+reg v192 --cu 255 --dec
+reg sgprWorkGroup0 --cu 0 --out /tmp/reg.txt
 ```
 
 For SGPR-like scalar expressions (e.g. `$sgpr...` / `$sN`), `reg` prints **one value per CU** (the 4 waves on the same CU share SGPR values).
