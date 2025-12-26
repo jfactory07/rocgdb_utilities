@@ -471,10 +471,13 @@ This uses thread ordering as a proxy for CU assignment:
 
         # Example line:
         #  1346 AMDGPU Wave 8:5:1:1022 (255,0,0)/1 "hipblaslt-bench"  label_openLoopL () at ...:1748
-        # `info threads` marks the current thread with a leading '*', e.g.:
-        #   * 325 AMDGPU Wave ... (0,0,0)/0 ...
-        # so accept an optional '*'.
-        pat = re.compile(r"^\s*\*?\s*(\d+)\s+AMDGPU\s+Wave\b.*\((\d+),\d+,\d+\)/(\d+)\b")
+        # `info threads` marks the current thread with a leading '*', and some builds print
+        # "Wave"/"wave" with different casing and optional spaces inside "(CU, 0, 0)/slot".
+        # Accept these variants.
+        pat = re.compile(
+            r"^\s*\*?\s*(\d+)\s+AMDGPU\s+Wave\b.*\(\s*(\d+)\s*,\s*\d+\s*,\s*\d+\s*\)/\s*(\d+)\b",
+            re.IGNORECASE,
+        )
 
         # First collect per-CU slot mapping; slot numbers are not guaranteed to start at 0 or 1,
         # so we'll sort slots per CU and map the first 4 to W0..W3.
@@ -678,6 +681,120 @@ This uses thread ordering as a proxy for CU assignment:
 
 
 RegCommand()
+
+
+class SwCuCommand(gdb.Command):
+    """swcu <cu> [w]
+
+Switch to a wave on a given CU.
+
+- <cu>: CU id (decimal/hex)
+- [w]: wave index 0..3 (mapped by sorting the per-CU /slot values from `info threads`)
+
+Examples:
+  (gdb) swcu 0
+  (gdb) swcu 0 2
+"""
+
+    def __init__(self):
+        super().__init__("swcu", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        argv = gdb.string_to_argv(arg)
+        if (not argv) or (len(argv) == 1 and argv[0] in ("--list", "-l")):
+            try:
+                out = gdb.execute("info threads", to_string=True)
+            except (gdb.error, gdb.MemoryError) as e:
+                raise gdb.GdbError(f"swcu: cannot run `info threads`: {e}")
+            pat = re.compile(
+                r"^\s*\*?\s*(\d+)\s+AMDGPU\s+Wave\b.*\(\s*(\d+)\s*,\s*\d+\s*,\s*\d+\s*\)/\s*(\d+)\b",
+                re.IGNORECASE,
+            )
+            cus = set()
+            for line in out.splitlines():
+                m = pat.match(line)
+                if not m:
+                    continue
+                cus.add(int(m.group(2)))
+            if not cus:
+                gdb.write("swcu: no AMDGPU CUs found in `info threads`\n")
+                return
+            cu_list = sorted(cus)
+            gdb.write("swcu: available CUs in `info threads`:\n")
+            gdb.write("  " + " ".join(str(x) for x in cu_list) + "\n")
+            return
+        try:
+            cu = int(argv[0], 0)
+        except Exception:
+            raise gdb.GdbError(f"swcu: invalid cu: {argv[0]}")
+
+        w = 0
+        if len(argv) >= 2:
+            try:
+                w = int(argv[1], 0)
+            except Exception:
+                raise gdb.GdbError(f"swcu: invalid w: {argv[1]}")
+        if w < 0 or w > 3:
+            raise gdb.GdbError("swcu: w must be 0..3")
+
+        try:
+            out = gdb.execute("info threads", to_string=True)
+        except (gdb.error, gdb.MemoryError) as e:
+            raise gdb.GdbError(f"swcu: cannot run `info threads`: {e}")
+
+        # Match AMDGPU wave lines (case-insensitive) and allow spaces inside "(CU, 0, 0)/slot".
+        pat = re.compile(
+            r"^\s*\*?\s*(\d+)\s+AMDGPU\s+Wave\b.*\(\s*(\d+)\s*,\s*\d+\s*,\s*\d+\s*\)/\s*(\d+)\b",
+            re.IGNORECASE,
+        )
+
+        slots = []  # list[(slot:int, tid:int)]
+        for line in out.splitlines():
+            m = pat.match(line)
+            if not m:
+                continue
+            tid = int(m.group(1))
+            cu_id = int(m.group(2))
+            slot = int(m.group(3))
+            if cu_id == cu:
+                slots.append((slot, tid))
+
+        if not slots:
+            # Include a hint of what CUs are present.
+            cus = set()
+            for line in out.splitlines():
+                m = pat.match(line)
+                if not m:
+                    continue
+                cus.add(int(m.group(2)))
+            hint = ""
+            if cus:
+                cu_list = sorted(cus)
+                hint = f" (available: {cu_list[0]}..{cu_list[-1]} , count={len(cu_list)}; try `swcu --list`)"
+            raise gdb.GdbError(f"swcu: CU{cu} not found in `info threads`{hint}")
+
+        slots.sort(key=lambda x: x[0])
+        if w >= len(slots):
+            raise gdb.GdbError(f"swcu: CU{cu} has only {len(slots)} wave(s) in `info threads`")
+
+        slot, tid = slots[w]
+        try:
+            gdb.execute(f"thread {tid}", to_string=True)
+        except gdb.error as e:
+            raise gdb.GdbError(f"swcu: failed to switch to thread {tid} (CU{cu}/slot {slot}): {e}")
+
+        # Select a fresh frame (helps in some ROCgdb sessions).
+        try:
+            f = gdb.newest_frame()
+            if f is not None:
+                f.select()
+        except Exception:
+            pass
+
+        gdb.write(f"swcu: switched to CU{cu} W{w} (slot {slot}, thread {tid})\n")
+
+
+SwCuCommand()
 
 #
 # Memory dump helpers (shared across kernels)

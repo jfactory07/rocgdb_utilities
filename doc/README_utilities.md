@@ -108,4 +108,14 @@ reg $v192 --max-cu 1 --fp16           # interpret each 32b lane as 2x fp16 (lo16
 reg $v192 --max-cu 1 --bf16           # interpret each 32b lane as 2x bf16 (lo16,hi16)
 ```
 
+### Switch to a specific CU wave (`swcu`)
+
+Quickly switch the selected GPU wave to a specific CU:
+
+```gdb
+swcu --list   # list CUs currently present in `info threads`
+swcu 0        # CU0, W0
+swcu 0 2      # CU0, W2
+```
+
 
