@@ -16,12 +16,12 @@ Add these entries to your `setupCommands`:
 ```json
 {
   "description": "ROCgdb autogen (.set → register map) + utilities (reg/lds/global/swcu)",
-  "text": "source ${workspaceFolder}/utilities/rocgdb_utilities/src/rocgdb_autogen.gdb",
+  "text": "source ${workspaceFolder}/rocgdb_utilities/src/rocgdb_autogen.gdb",
   "ignoreFailures": false
 },
 {
   "description": "ROCgdb utilities (reg/lds/global/swcu)",
-  "text": "source ${workspaceFolder}/utilities/rocgdb_utilities/src/rocgdb_utilities.gdb",
+  "text": "source ${workspaceFolder}/rocgdb_utilities/src/rocgdb_utilities.gdb",
   "ignoreFailures": false
 }
 ```
@@ -29,11 +29,8 @@ Add these entries to your `setupCommands`:
 #### ROCgdb (manual)
 
 ```gdb
-# If you are in hipblaslt workspace root:
-source utilities/rocgdb_utilities/src/rocgdb_autogen.gdb
-source utilities/rocgdb_utilities/src/rocgdb_utilities.gdb
 
-# If your `pwd` has a sibling folder named `rocgdb_utilities/`:
+# If your current `pwd` has a sibling folder named `rocgdb_utilities/`:
 # source rocgdb_utilities/src/rocgdb_autogen.gdb
 # source rocgdb_utilities/src/rocgdb_utilities.gdb
 
