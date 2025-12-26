@@ -93,6 +93,11 @@ reg v192 --cu 255
 reg sgprWorkGroup0 --cu 0 --out /tmp/reg.txt
 ```
 
+Shorthand for indexed registers:
+
+- `sgprFoo+1` is treated as `sgprFoo_1` (i.e. register index +1), so `reg sgprSrdA+1` maps to `$s{sgprSrdA+1}`.
+- Same for `vgprFoo+K`.
+
 For SGPR-like scalar expressions (e.g. `$sgpr...` / `$sN`), `reg` prints **one value per CU** (the 4 waves on the same CU share SGPR values).
 Output is **16 values per line**, prefixed by a CU range like `[0-15]` (the per-value CU index is omitted).
 

@@ -37,6 +37,22 @@ def _rewrite_expr_via_autogen_map(expr: str) -> str:
         sym2reg = getattr(gdb, "_roc_autogen_sym2reg", None)
         if not isinstance(sym2reg, dict):
             return expr
+
+        # Support register-index expressions like:
+        #   $sgprSrdA+1  -> $s{base+1}  (maps to sgprSrdA_1)
+        #   $vgprFoo+12  -> $v{base+12}
+        m = re.match(r"^\$(?P<name>(?:sgpr|vgpr)[A-Za-z_][A-Za-z0-9_]*)\s*\+\s*(?P<off>0x[0-9a-fA-F]+|\d+)\s*$", expr)
+        if m:
+            base_name = m.group("name")
+            off = int(m.group("off"), 0)
+            kv0 = sym2reg.get(base_name)
+            if kv0 and len(kv0) == 2:
+                kind0, idx0 = kv0[0], int(kv0[1])
+                if kind0 == "s":
+                    return f"$s{idx0 + off}"
+                if kind0 == "v":
+                    return f"$v{idx0 + off}"
+
         key = expr[1:]
         kv = sym2reg.get(key)
         if not kv or len(kv) != 2:
@@ -70,7 +86,7 @@ def _normalize_reg_expr(expr: str) -> str:
         if isinstance(sym2reg, dict) and expr in sym2reg:
             return "$" + expr
 
-        if re.match(r"^(sgpr|vgpr)[A-Za-z_][A-Za-z0-9_]*(?:_[0-9]+)?$", expr):
+        if re.match(r"^(sgpr|vgpr)[A-Za-z_][A-Za-z0-9_]*(?:_[0-9]+)?(?:\s*\+\s*(?:0x[0-9a-fA-F]+|\d+))?$", expr):
             return "$" + expr
         if re.match(r"^[sv][0-9]+$", expr):
             return "$" + expr
@@ -1139,7 +1155,11 @@ class _GlobalCmd(gdb.Command):
                     else:
                         fmt = argv[2].lower()
 
+        # Normalize/rewrite register-like expressions so users can omit '$' and can use
+        # `sgprFoo+1` as a shorthand for `sgprFoo_1` (register index offset).
+        addr_expr = _rewrite_expr_via_autogen_map(_normalize_reg_expr(addr_expr))
         if hi_expr is not None:
+            hi_expr = _rewrite_expr_via_autogen_map(_normalize_reg_expr(hi_expr))
             lo_expr = addr_expr
             # Use 64-bit math; user may write `$lo+16` etc.
             addr_u64 = (((_mem_eval_u64(hi_expr) & 0xFFFFFFFF) << 32) | (_mem_eval_u64(lo_expr) & 0xFFFFFFFF)) & ((1 << 64) - 1)
