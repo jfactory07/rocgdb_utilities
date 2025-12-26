@@ -22,6 +22,33 @@ import re
 import os
 
 
+def _rewrite_expr_via_autogen_map(expr: str) -> str:
+    """
+    If rocgdb_autogen.gdb is loaded, it exports `gdb._roc_autogen_sym2reg`
+    mapping symbol names (without leading '$') to ('s'/'v', index).
+    Use that to rewrite $sgprFoo/$vgprBar[_K] to $sN/$vN so evaluation is
+    per-thread (not a snapshot convenience var).
+    """
+    try:
+        if not expr or not expr.startswith("$"):
+            return expr
+        sym2reg = getattr(gdb, "_roc_autogen_sym2reg", None)
+        if not isinstance(sym2reg, dict):
+            return expr
+        key = expr[1:]
+        kv = sym2reg.get(key)
+        if not kv or len(kv) != 2:
+            return expr
+        kind, idx = kv[0], int(kv[1])
+        if kind == "s":
+            return f"$s{idx}"
+        if kind == "v":
+            return f"$v{idx}"
+        return expr
+    except Exception:
+        return expr
+
+
 def _intish_value(v, lane_idx=None):
     """
     Convert a gdb.Value to an int when possible (integral/pointer/enums).
@@ -299,6 +326,7 @@ This uses thread ordering as a proxy for CU assignment:
             return
 
         expr = argv[0]
+        eval_expr = _rewrite_expr_via_autogen_map(expr)
         max_cu = None
         cu_filter = []  # list[int], if non-empty only show these CUs (in given order)
         out_hex = True
@@ -584,8 +612,8 @@ This uses thread ordering as a proxy for CU assignment:
                         f.select()
                 except Exception:
                     pass
-                _dbg(f"eval: tid={tid} CU{cu} slot={slot} loc={_frame_loc_str()} expr={expr}")
-                v = gdb.parse_and_eval(expr)
+                _dbg(f"eval: tid={tid} CU{cu} slot={slot} loc={_frame_loc_str()} expr={eval_expr}")
+                v = gdb.parse_and_eval(eval_expr)
                 cu_to_slot_val[cu][slot] = _capture_in_current_thread(v)
             except (gdb.error, gdb.MemoryError) as e:
                 _dbg(f"ERR: tid={tid} CU{cu} slot={slot} err={e}")
@@ -681,7 +709,8 @@ This uses thread ordering as a proxy for CU assignment:
             return
 
         # Scalar/table mode (SGPR or VGPR with --lane N)
-        sgpr_like = (lane_idx is None) and (expr.startswith("$sgpr") or re.match(r"^\\$s\\d+$", expr) is not None)
+        # (Use eval_expr so `$sgprFoo` rewritten to `$sN` is also treated as SGPR-like.)
+        sgpr_like = (lane_idx is None) and (expr.startswith("$sgpr") or re.match(r"^\$s\d+$", eval_expr) is not None)
         if sgpr_like:
             # SGPR-like values are identical across the 4 waves on the same CU.
             # Print compactly: 16 CUs per line.

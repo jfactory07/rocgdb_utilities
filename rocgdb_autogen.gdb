@@ -182,6 +182,21 @@ def _gdb_define_roc_update(resolved: dict, v_uses: set, s_uses: set, ranges: set
     v_list = expand(v_uses, "v")
     s_list = expand(s_uses, "s")
 
+    # Export a symbol->(kind,idx) map for other scripts (e.g. `reg`) so they can
+    # evaluate $sgprFoo/$vgprBar dynamically by rewriting to $sN/$vN per-thread,
+    # without relying on the snapshot convenience vars.
+    #
+    # Key format: without leading '$' (e.g. "sgprWorkGroup0", "vgprValuA_3")
+    sym2reg = {}
+    for name in base_names:
+        idx = resolved[name]
+        sym2reg[name] = ("v", int(idx)) if name.startswith("vgpr") else ("s", int(idx))
+    for name, off, ridx in v_list:
+        sym2reg[f"{name}_{off}"] = ("v", int(ridx))
+    for name, off, ridx in s_list:
+        sym2reg[f"{name}_{off}"] = ("s", int(ridx))
+    setattr(gdb, "_roc_autogen_sym2reg", sym2reg)
+
     # Build the gdb `define roc_update` body as one multi-line string.
     lines = []
     lines.append("define roc_update")
