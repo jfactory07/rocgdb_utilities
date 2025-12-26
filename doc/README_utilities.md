@@ -6,6 +6,18 @@ Source once per debug session:
 source rocgdb_utilities/rocgdb_utilities.gdb
 ```
 
+### VSCode setup (`launch.json`)
+
+Add this to your `setupCommands` so VSCode/ROCgdb loads the commands automatically:
+
+```json
+{
+  "setupCommands": [
+    { "text": "source rocgdb_utilities/rocgdb_utilities.gdb" }
+  ]
+}
+```
+
 ### LDS / Global memory dump helpers
 
 `rocgdb_utilities.gdb` defines:
