@@ -64,7 +64,7 @@ Type "apropos -v word" for full documentation of commands related to "word".
 Command name abbreviations are allowed if unambiguous.
 ```
 
-Screenshot: output of `reg` after the scripts are sourced successfully.
+#### Screenshot(output of `reg`)
 
 <img width="1257" height="171" alt="image" src="https://github.com/user-attachments/assets/6caef83d-c1ab-4790-9773-64a321594971" />
 
