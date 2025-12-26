@@ -100,7 +100,8 @@ For VGPRs (lane-level values), add `--lane N` to pick which lane to display per 
 
 ```gdb
 reg $v192 --max-cu 32 --dec           # default: prints 4 lines per wave, 16 lanes per line
-reg $v192 --lane 0 --max-cu 32 --dec  # pick one lane
+reg $v192 --lane 0 --max-cu 32 --dec      # pick one lane
+reg $v192 --lane 0-15 --max-cu 1 --dec    # pick a lane range (inclusive)
 reg $v192 --max-cu 1 --dec --show-err # show error messages for ERR cells
 reg $v192 --max-cu 1 --fp32           # interpret each 32b lane as 1x fp32
 reg $v192 --max-cu 1 --fp16           # interpret each 32b lane as 2x fp16 (lo16,hi16)

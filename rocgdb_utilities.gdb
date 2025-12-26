@@ -165,6 +165,32 @@ def _format_lanes_chunks_u32(v, out_hex=True, per_line=16, float_mode=None):
     return chunks
 
 
+def _format_lanes_range_u32(v, lane_lo, lane_hi, out_hex=True, per_line=16, float_mode=None):
+    """Format lanes [lane_lo..lane_hi] (inclusive) as multiple lines, `per_line` lanes per line."""
+    try:
+        lo, hi = v.type.range()
+        lo, hi = int(lo), int(hi)
+    except Exception:
+        return ["ERR"], 0, -1
+
+    lo = max(lo, int(lane_lo))
+    hi = min(hi, int(lane_hi))
+    if hi < lo:
+        return [], lo, hi
+
+    parts = []
+    for i in range(lo, hi + 1):
+        try:
+            parts.append(_u32_to_str(_intish_value(v[i], lane_idx=None), out_hex=out_hex, float_mode=float_mode))
+        except Exception:
+            parts.append("ERR")
+
+    chunks = []
+    for base in range(0, len(parts), per_line):
+        chunks.append(" ".join(parts[base:base + per_line]))
+    return chunks, lo, hi
+
+
 def _value_to_cell(v, out_hex=True, lane_idx=None):
     """
     Convert a gdb.Value to a printable cell string.
@@ -279,6 +305,8 @@ This uses thread ordering as a proxy for CU assignment:
         # If expr is a VGPR (vector register), default is to print ALL lanes.
         # Use --lane N to select a single lane.
         lane_idx = None
+        lane_lo = None
+        lane_hi = None
         show_err = False
         debug = False
         escape = False
@@ -322,10 +350,21 @@ This uses thread ordering as a proxy for CU assignment:
                 i += 1
                 continue
             if a == "--lane" and i + 1 < len(argv):
+                s = argv[i + 1]
                 try:
-                    lane_idx = int(argv[i + 1], 0)
+                    if "-" in s:
+                        lo_s, hi_s = s.split("-", 1)
+                        lane_lo = int(lo_s, 0)
+                        lane_hi = int(hi_s, 0)
+                        if lane_hi < lane_lo:
+                            raise ValueError("lane range hi < lo")
+                        lane_idx = None
+                    else:
+                        lane_idx = int(s, 0)
+                        lane_lo = None
+                        lane_hi = None
                 except Exception:
-                    raise gdb.GdbError(f"reg: invalid --lane value: {argv[i+1]}")
+                    raise gdb.GdbError(f"reg: invalid --lane value: {s} (use N or LO-HI)")
                 i += 2
                 continue
             if a == "--show-err":
@@ -355,7 +394,16 @@ This uses thread ordering as a proxy for CU assignment:
             """
             try:
                 if lane_idx is None and _is_array_value(v):
-                    return ("LANES", _format_lanes_chunks_u32(v, out_hex=out_hex, per_line=16, float_mode=float_mode))
+                    if lane_lo is not None and lane_hi is not None:
+                        lines, lo, hi = _format_lanes_range_u32(v, lane_lo, lane_hi, out_hex=out_hex, per_line=16, float_mode=float_mode)
+                        return ("LANES", (lines, lo, hi))
+                    # full lanes
+                    try:
+                        lo0, hi0 = v.type.range()
+                        lo0, hi0 = int(lo0), int(hi0)
+                    except Exception:
+                        lo0, hi0 = 0, -1
+                    return ("LANES", (_format_lanes_chunks_u32(v, out_hex=out_hex, per_line=16, float_mode=float_mode), lo0, hi0))
             except Exception:
                 # Fall through to scalar formatting
                 pass
@@ -573,10 +621,10 @@ This uses thread ordering as a proxy for CU assignment:
                         msg = captured[1]
                         wout.write(f"{cu:<3d} W{w} " + ("ERR: " + msg if show_err else "ERR") + "\n")
                     elif isinstance(captured, tuple) and len(captured) == 2 and captured[0] == "LANES":
-                        lines = captured[1]
+                        lines, lo0, hi0 = captured[1]
                         for li, s in enumerate(lines):
-                            lo_lane = li * 16
-                            hi_lane = min(lo_lane + 15, lo_lane + 16 - 1)
+                            lo_lane = lo0 + li * 16
+                            hi_lane = min(lo_lane + 15, hi0)
                             prefix = f"{cu:<3d} W{w}" if li == 0 else " " * 6
                             wout.write(f"{prefix} [{lo_lane:02d}-{hi_lane:02d}] {s}\n")
                     else:
