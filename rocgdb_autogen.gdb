@@ -11,13 +11,16 @@
 #   (gdb) roc_autogen_enable            # default: inline parser (no external script needed)
 #
 # Commands:
-#   - roc_autogen [--force]
-#   - roc_autogen_enable [--force]
+#   - roc_autogen [--force] [--full]
+#   - roc_autogen_enable [--force] [--full]
 #
 # Notes:
-#   - This caches per-asm file: it regenerates when the asm file changed (or when forced).
-#   - It parses the **entire** `.s` file, so `reg --map` includes all `.set` symbols,
-#     not just those before the current stop location.
+#   - This caches per-asm file: it regenerates when the asm file changed, or when you
+#     advance to a later line in the same file (or when forced).
+#   - Default behavior is **stop-line-aware**: it only uses `.set` definitions that
+#     are in-scope at the current stop location. This avoids wrong mappings when a
+#     symbol is redefined later in the file (common in Tensile, e.g. reset offsets).
+#   - Use `--full` to parse the entire file and take the last meaningful `.set`.
 #
 
 python
@@ -65,7 +68,7 @@ def _strip_comment(line: str) -> str:
     return line.strip()
 
 
-def _parse_defs_uses_ranges(asm_path: str):
+def _parse_defs_uses_ranges(asm_path: str, upto_line: int = None):
     defs = {}          # name -> expr string
     v_uses = set()     # (name, off)
     s_uses = set()     # (name, off)
@@ -73,6 +76,8 @@ def _parse_defs_uses_ranges(asm_path: str):
 
     with open(asm_path, "r", encoding="utf-8", errors="replace") as f:
         for ln, raw in enumerate(f, start=1):
+            if upto_line is not None and ln > upto_line:
+                break
             line = _strip_comment(raw)
             if not line:
                 continue
@@ -278,8 +283,8 @@ def _gdb_define_roc_update(resolved: dict, v_uses: set, s_uses: set, ranges: set
     gdb.execute("\n".join(lines), to_string=True)
 
 
-def _roc_autogen_inline(asm_path: str):
-    defs, v_uses, s_uses, ranges = _parse_defs_uses_ranges(asm_path)
+def _roc_autogen_inline(asm_path: str, upto_line: int = None):
+    defs, v_uses, s_uses, ranges = _parse_defs_uses_ranges(asm_path, upto_line=upto_line)
     resolved = _resolve_all(defs)
     _gdb_define_roc_update(resolved, v_uses, s_uses, ranges)
     # refresh immediately
@@ -313,7 +318,7 @@ def _roc_current_asm_and_line():
 
 _roc_autogen_state = {
     "in_progress": False,
-    # asm_path -> {"mtime": float}
+    # asm_path -> {"mtime": float, "mode": "upto"|"full", "max_line": int}
     "cache": {},
 }
 
@@ -330,6 +335,7 @@ class RocAutogenCommand(gdb.Command):
 
         argv = gdb.string_to_argv(arg)
         force = False
+        full = False
 
         i = 0
         while i < len(argv):
@@ -337,8 +343,11 @@ class RocAutogenCommand(gdb.Command):
             if a == "--force":
                 force = True
                 i += 1
+            elif a == "--full":
+                full = True
+                i += 1
             else:
-                raise gdb.GdbError("roc_autogen: unknown/invalid args. Use: roc_autogen [--force]")
+                raise gdb.GdbError("roc_autogen: unknown/invalid args. Use: roc_autogen [--force] [--full]")
 
         asm, line = _roc_current_asm_and_line()
         if asm is None:
@@ -353,13 +362,18 @@ class RocAutogenCommand(gdb.Command):
         except Exception:
             mtime = None
 
+        mode = "full" if full else "upto"
         cache = _roc_autogen_state["cache"].get(asm)
         need = force
         if cache is None:
             need = True
         else:
-            # Regenerate if asm changed.
+            # Regenerate if asm changed, mode changed, or we advanced to a later line (upto mode).
             if cache.get("mtime") != mtime:
+                need = True
+            if cache.get("mode") != mode:
+                need = True
+            if mode == "upto" and int(line) > int(cache.get("max_line", -1)):
                 need = True
 
         if not need:
@@ -372,9 +386,11 @@ class RocAutogenCommand(gdb.Command):
 
         _roc_autogen_state["in_progress"] = True
         try:
-            _roc_autogen_inline(asm_path=asm)
+            _roc_autogen_inline(asm_path=asm, upto_line=None if full else int(line))
             _roc_autogen_state["cache"][asm] = {
                 "mtime": mtime,
+                "mode": mode,
+                "max_line": int(line) if not full else -1,
             }
         finally:
             _roc_autogen_state["in_progress"] = False
@@ -389,6 +405,7 @@ class RocAutogenEnableCommand(gdb.Command):
     def invoke(self, arg, from_tty):
         argv = gdb.string_to_argv(arg)
         force = False
+        full = False
 
         i = 0
         while i < len(argv):
@@ -396,12 +413,17 @@ class RocAutogenEnableCommand(gdb.Command):
             if a == "--force":
                 force = True
                 i += 1
+            elif a == "--full":
+                full = True
+                i += 1
             else:
-                raise gdb.GdbError("roc_autogen_enable: unknown/invalid args. Use: roc_autogen_enable [--force]")
+                raise gdb.GdbError("roc_autogen_enable: unknown/invalid args. Use: roc_autogen_enable [--force] [--full]")
 
         if _roc_autogen_event["connected"] and not force:
             gdb.write("roc_autogen_enable: already enabled.\n")
             return
+
+        _roc_autogen_event["full"] = full
 
         # (Re)connect stop-event handler (does not conflict with user hook-stop / VSCode).
         try:
@@ -428,13 +450,14 @@ RocAutogenEnableCommand()
 # -----------------------------------------------------------------------------
 
 _roc_autogen_autoinstall = {"connected": False}
-_roc_autogen_event = {"connected": False}
+_roc_autogen_event = {"connected": False, "full": False}
 
 
 def _roc_autogen_on_stop(event):
     # Run quietly; only does real work if we're stopped in a Tensile `.s` frame.
     try:
-        gdb.execute("roc_autogen", to_string=True)
+        cmd = "roc_autogen --full" if _roc_autogen_event.get("full") else "roc_autogen"
+        gdb.execute(cmd, to_string=True)
     except Exception:
         pass
 
@@ -449,6 +472,7 @@ def _roc_autogen_on_first_stop(event):
 
     # Enable the stop-event handler (no hook-stop conflicts).
     try:
+        _roc_autogen_event["full"] = False
         gdb.execute("roc_autogen_enable", to_string=True)
         # Try once immediately on this stop (quiet). If we're not in asm yet, it just no-ops.
         gdb.execute("roc_autogen", to_string=True)
