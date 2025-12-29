@@ -1,0 +1,124 @@
+{
+  "name": "rocgdb-register-hover",
+  "displayName": "rocgdb Register Hover",
+  "description": "Hover AMDGPU assembly registers (SGPR/VGPR) and show values via rocgdb for the current stopped lane/wavefront.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Debuggers",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./src/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "rocgdbHover.start",
+        "title": "rocgdbHover: Start rocgdb session"
+      },
+      {
+        "command": "rocgdbHover.stop",
+        "title": "rocgdbHover: Stop rocgdb session"
+      },
+      {
+        "command": "rocgdbHover.status",
+        "title": "rocgdbHover: Show rocgdb hover status"
+      },
+      {
+        "command": "rocgdbHover.openLog",
+        "title": "rocgdbHover: Open log file"
+      }
+    ],
+    "configuration": {
+      "title": "rocgdb Register Hover",
+      "properties": {
+        "rocgdbHover.backend": {
+          "type": "string",
+          "default": "auto",
+          "enum": ["auto", "activeCppdbg", "spawnRocgdb"],
+          "description": "How to talk to rocgdb: auto=prefer active cppdbg session; activeCppdbg=use current debug session; spawnRocgdb=launch a standalone rocgdb MI process."
+        },
+        "rocgdbHover.rocgdbPath": {
+          "type": "string",
+          "default": "rocgdb",
+          "description": "Path to rocgdb executable."
+        },
+        "rocgdbHover.rocgdbArgs": {
+          "type": "array",
+          "default": [],
+          "description": "Extra arguments passed to rocgdb (in addition to --interpreter=mi2 -q).",
+          "items": { "type": "string" }
+        },
+        "rocgdbHover.startupCommands": {
+          "type": "array",
+          "default": [
+            "set pagination off",
+            "set confirm off"
+          ],
+          "description": "Commands run after launching rocgdb (use this to file/attach/target/break/interrupt).",
+          "items": { "type": "string" }
+        },
+        "rocgdbHover.contextCommands": {
+          "type": "array",
+          "default": [],
+          "description": "Commands run before each hover query (optional; use to select agent/queue/dispatch/etc).",
+          "items": { "type": "string" }
+        },
+        "rocgdbHover.laneCount": {
+          "type": "number",
+          "default": 64,
+          "minimum": 1,
+          "maximum": 1024,
+          "description": "How many lanes to query for VGPR. Default 64 for a wavefront."
+        },
+        "rocgdbHover.sgprLane": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 1023,
+          "description": "Which lane to select when reading SGPR (SGPR is uniform, any lane is fine)."
+        },
+        "rocgdbHover.hoverTimeoutMs": {
+          "type": "number",
+          "default": 800,
+          "minimum": 50,
+          "maximum": 10000,
+          "description": "Timeout (ms) for each hover query."
+        },
+        "rocgdbHover.logFile": {
+          "type": "string",
+          "default": "/tmp/rocgdb-register-hover.log",
+          "description": "Write detailed logs to this file (remote path in container). Empty disables file logging."
+        },
+        "rocgdbHover.logLevel": {
+          "type": "string",
+          "default": "info",
+          "enum": ["error", "info", "debug"],
+          "description": "Logging verbosity for the log file."
+        },
+        "rocgdbHover.cppdbgTransport": {
+          "type": "string",
+          "default": "auto",
+          "enum": ["auto", "evaluateRepl", "evaluateMi", "executeCommand"],
+          "description": "How to send console commands to the active cppdbg debug adapter. IMPORTANT: some adapters crash on unknown requests; default avoids executeCommand."
+        },
+        "rocgdbHover.autoSelectGpuThread": {
+          "type": "boolean",
+          "default": true,
+          "description": "When no GPU lanes/registers are visible, try to auto-switch GDB to a GPU thread by parsing `info threads` output."
+        },
+        "rocgdbHover.gpuThreadRegex": {
+          "type": "string",
+          "default": "(gpu|amdgpu|hsa|dispatch|queue|wave|lane)",
+          "description": "Regex (case-insensitive) used to identify GPU-like threads in `info threads` output when autoSelectGpuThread is enabled."
+        }
+      }
+    }
+  }
+}
+
