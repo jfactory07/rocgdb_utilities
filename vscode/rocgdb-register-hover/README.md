@@ -20,3 +20,4 @@ See `package.json` for all `rocgdbHover.*` settings.
 
 ### Notes
 - VGPR values are read via `info registers vXX` and may return a 64-lane vector depending on your rocgdb build.
+<img width="1086" height="270" alt="image" src="https://github.com/user-attachments/assets/b81d807d-30fa-440e-97d9-2ffc5c99655c" />
