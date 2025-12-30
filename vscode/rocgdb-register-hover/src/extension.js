@@ -411,6 +411,115 @@ function toPrintableString(x) {
   }
 }
 
+function encodeCommandArgs(args) {
+  // VS Code command URI expects a JSON-encoded argument list.
+  // Example: command:ext.cmd?%5B%22fp32%22%5D
+  return encodeURIComponent(JSON.stringify(args));
+}
+
+function escapeForCodeBlock(s) {
+  // Avoid breaking markdown code fences
+  return String(s || '').replace(/```/g, '``\\`');
+}
+
+function parseBigIntLoose(s) {
+  const t = String(s || '').trim();
+  if (!t) return null;
+  try {
+    if (/^[+-]?0x[0-9a-fA-F]+$/.test(t)) return BigInt(t);
+    if (/^[+-]?\d+$/.test(t)) return BigInt(t);
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function toUint32FromValueString(v) {
+  const n = parseBigIntLoose(v);
+  if (n == null) return null;
+  return Number(n & 0xffffffffn);
+}
+
+function uint32ToInt32(u) {
+  const x = u >>> 0;
+  return (x & 0x80000000) ? (x - 0x100000000) : x;
+}
+
+function uint32ToHex(u) {
+  return `0x${(u >>> 0).toString(16).padStart(8, '0')}`;
+}
+
+function uint32ToFloat32(u) {
+  const buf = new ArrayBuffer(4);
+  const dv = new DataView(buf);
+  dv.setUint32(0, u >>> 0, true);
+  return dv.getFloat32(0, true);
+}
+
+function bf16ToFloat32(b16) {
+  // bf16: 1 sign, 8 exp, 7 mantissa.
+  // Convert by placing bf16 bits into top 16 bits of a float32.
+  const u = (b16 & 0xffff) << 16;
+  return uint32ToFloat32(u >>> 0);
+}
+
+function fp16ToFloat32(h) {
+  // IEEE 754 half to float32
+  const x = h & 0xffff;
+  const s = (x >>> 15) & 0x1;
+  const e = (x >>> 10) & 0x1f;
+  const f = x & 0x3ff;
+  if (e === 0) {
+    if (f === 0) return s ? -0.0 : 0.0;
+    // subnormal
+    const v = (f / 1024) * Math.pow(2, -14);
+    return s ? -v : v;
+  }
+  if (e === 31) {
+    if (f === 0) return s ? -Infinity : Infinity;
+    return NaN;
+  }
+  const v = (1 + f / 1024) * Math.pow(2, e - 15);
+  return s ? -v : v;
+}
+
+function formatUint32AsType(u32, dataType) {
+  const u = u32 >>> 0;
+  switch (dataType) {
+    case 'uint32':
+      return `${u} (${uint32ToHex(u)})`;
+    case 'int32': {
+      const i = uint32ToInt32(u);
+      return `${i} (${uint32ToHex(u)})`;
+    }
+    case 'fp32': {
+      const f = uint32ToFloat32(u);
+      return `${Number.isNaN(f) ? 'NaN' : String(f)} (${uint32ToHex(u)})`;
+    }
+    case 'bf16': {
+      const lo = u & 0xffff;
+      const hi = (u >>> 16) & 0xffff;
+      const flo = bf16ToFloat32(lo);
+      const fhi = bf16ToFloat32(hi);
+      const slo = Number.isNaN(flo) ? 'NaN' : String(flo);
+      const shi = Number.isNaN(fhi) ? 'NaN' : String(fhi);
+      return `lo=${slo} (0x${lo.toString(16).padStart(4, '0')}), hi=${shi} (0x${hi.toString(16).padStart(4, '0')})`;
+    }
+    case 'fp16': {
+      const lo = u & 0xffff;
+      const hi = (u >>> 16) & 0xffff;
+      const flo = fp16ToFloat32(lo);
+      const fhi = fp16ToFloat32(hi);
+      const slo = Number.isNaN(flo) ? 'NaN' : String(flo);
+      const shi = Number.isNaN(fhi) ? 'NaN' : String(fhi);
+      return `lo=${slo} (0x${lo.toString(16).padStart(4, '0')}), hi=${shi} (0x${hi.toString(16).padStart(4, '0')})`;
+    }
+    case 'hex':
+    default:
+      return uint32ToHex(u);
+  }
+}
+
 function normalizeDebugAdapterOutput(r) {
   if (r == null) return '';
   if (typeof r === 'string') return r;
@@ -483,7 +592,10 @@ function isAsmLikeDocument(document) {
 }
 
 // Cache parsed ".set/.equ" symbols per document version.
-// key = `${fsPath}:${version}` -> Map<string, number>
+// Cache parsed ".set/.equ" symbols per document version *and* line bucket.
+// Tensile kernels may later `.set foo, UNDEF` (cleanup), so we must resolve symbols
+// as-of the hovered line, not using the last definition in the whole file.
+// key = `${fsPath}:${version}:${bucket}` -> { env: Map<string, bigint> }
 const asmSymbolCache = new Map();
 
 function stripAsmComments(line) {
@@ -509,57 +621,297 @@ function parseAsmImmediate(s) {
   return null;
 }
 
-function buildAsmSymbolTable(document) {
-  const table = new Map();
-  const lineCount = document.lineCount || 0;
-  for (let i = 0; i < lineCount; i++) {
+function tokenizeAsmExpr(expr) {
+  const s = String(expr || '');
+  const tokens = [];
+  let i = 0;
+  const isIdStart = (c) => /[A-Za-z_]/.test(c);
+  const isId = (c) => /[A-Za-z0-9_]/.test(c);
+  while (i < s.length) {
+    const c = s[i];
+    if (/\s/.test(c)) { i++; continue; }
+    // operators (multi-char first)
+    if (s.startsWith('<<', i) || s.startsWith('>>', i)) {
+      tokens.push({ t: 'op', v: s.slice(i, i + 2) }); i += 2; continue;
+    }
+    if ('+-*/%&|^()'.includes(c)) {
+      tokens.push({ t: 'op', v: c }); i++; continue;
+    }
+    // number
+    if (c === '0' && (s[i + 1] === 'x' || s[i + 1] === 'X')) {
+      let j = i + 2;
+      while (j < s.length && /[0-9a-fA-F]/.test(s[j])) j++;
+      tokens.push({ t: 'num', v: s.slice(i, j) });
+      i = j; continue;
+    }
+    if (/[0-9]/.test(c)) {
+      let j = i;
+      while (j < s.length && /[0-9]/.test(s[j])) j++;
+      tokens.push({ t: 'num', v: s.slice(i, j) });
+      i = j; continue;
+    }
+    // identifier
+    if (isIdStart(c)) {
+      let j = i + 1;
+      while (j < s.length && isId(s[j])) j++;
+      tokens.push({ t: 'id', v: s.slice(i, j) });
+      i = j; continue;
+    }
+    // unknown char -> stop (fail)
+    return null;
+  }
+  return tokens;
+}
+
+function evalAsmExprBigInt(expr, defs, memo, visiting) {
+  const tokens0 = tokenizeAsmExpr(expr);
+  if (!tokens0) return null;
+
+  // Insert unary +/- as (0 +/- x) to simplify.
+  const tokens = [];
+  for (let i = 0; i < tokens0.length; i++) {
+    const tok = tokens0[i];
+    if (tok.t === 'op' && (tok.v === '+' || tok.v === '-') ) {
+      const prev = tokens[tokens.length - 1];
+      const isUnary = !prev || (prev.t === 'op' && prev.v !== ')') || (prev.t === 'op' && prev.v === '(');
+      if (isUnary) {
+        tokens.push({ t: 'num', v: '0' });
+      }
+    }
+    tokens.push(tok);
+  }
+
+  const prec = { '*': 7, '/': 7, '%': 7, '+': 6, '-': 6, '<<': 5, '>>': 5, '&': 4, '^': 3, '|': 2 };
+  const isOp = (x) => x && x.t === 'op' && x.v !== '(' && x.v !== ')';
+
+  // shunting-yard to RPN
+  const out = [];
+  const stack = [];
+  for (const tok of tokens) {
+    if (tok.t === 'num' || tok.t === 'id') {
+      out.push(tok);
+      continue;
+    }
+    if (tok.t === 'op' && tok.v === '(') { stack.push(tok); continue; }
+    if (tok.t === 'op' && tok.v === ')') {
+      while (stack.length && stack[stack.length - 1].v !== '(') out.push(stack.pop());
+      if (!stack.length) return null;
+      stack.pop();
+      continue;
+    }
+    if (isOp(tok)) {
+      while (stack.length && isOp(stack[stack.length - 1]) && (prec[stack[stack.length - 1].v] >= prec[tok.v])) {
+        out.push(stack.pop());
+      }
+      stack.push(tok);
+      continue;
+    }
+    return null;
+  }
+  while (stack.length) {
+    const x = stack.pop();
+    if (x.v === '(' || x.v === ')') return null;
+    out.push(x);
+  }
+
+  // eval RPN
+  const st = [];
+  const toVal = (tok) => {
+    if (tok.t === 'num') {
+      try { return BigInt(tok.v); } catch { return null; }
+    }
+    if (tok.t === 'id') {
+      const name = tok.v;
+      if (memo.has(name)) return memo.get(name);
+      if (visiting.has(name)) return null; // cycle
+      const rhs = defs.get(name);
+      if (rhs == null) return null;
+      visiting.add(name);
+      const v = evalAsmExprBigInt(rhs, defs, memo, visiting);
+      visiting.delete(name);
+      if (v == null) return null;
+      memo.set(name, v);
+      return v;
+    }
+    return null;
+  };
+
+  for (const tok of out) {
+    if (tok.t === 'num' || tok.t === 'id') {
+      const v = toVal(tok);
+      if (v == null) return null;
+      st.push(v);
+      continue;
+    }
+    if (tok.t === 'op') {
+      const b = st.pop();
+      const a = st.pop();
+      if (a == null || b == null) return null;
+      switch (tok.v) {
+        case '+': st.push(a + b); break;
+        case '-': st.push(a - b); break;
+        case '*': st.push(a * b); break;
+        case '/': if (b === 0n) return null; st.push(a / b); break;
+        case '%': if (b === 0n) return null; st.push(a % b); break;
+        case '<<': st.push(a << b); break;
+        case '>>': st.push(a >> b); break;
+        case '&': st.push(a & b); break;
+        case '^': st.push(a ^ b); break;
+        case '|': st.push(a | b); break;
+        default: return null;
+      }
+      continue;
+    }
+    return null;
+  }
+  if (st.length !== 1) return null;
+  return st[0];
+}
+
+function evalAsmExprBigIntWithEnv(expr, env) {
+  const tokens0 = tokenizeAsmExpr(expr);
+  if (!tokens0) return null;
+
+  // Insert unary +/- as (0 +/- x)
+  const tokens = [];
+  for (let i = 0; i < tokens0.length; i++) {
+    const tok = tokens0[i];
+    if (tok.t === 'op' && (tok.v === '+' || tok.v === '-')) {
+      const prev = tokens[tokens.length - 1];
+      const isUnary = !prev || (prev.t === 'op' && prev.v !== ')') || (prev.t === 'op' && prev.v === '(');
+      if (isUnary) tokens.push({ t: 'num', v: '0' });
+    }
+    tokens.push(tok);
+  }
+
+  const prec = { '*': 7, '/': 7, '%': 7, '+': 6, '-': 6, '<<': 5, '>>': 5, '&': 4, '^': 3, '|': 2 };
+  const isOp = (x) => x && x.t === 'op' && x.v !== '(' && x.v !== ')';
+
+  const out = [];
+  const stack = [];
+  for (const tok of tokens) {
+    if (tok.t === 'num' || tok.t === 'id') { out.push(tok); continue; }
+    if (tok.t === 'op' && tok.v === '(') { stack.push(tok); continue; }
+    if (tok.t === 'op' && tok.v === ')') {
+      while (stack.length && stack[stack.length - 1].v !== '(') out.push(stack.pop());
+      if (!stack.length) return null;
+      stack.pop();
+      continue;
+    }
+    if (isOp(tok)) {
+      while (stack.length && isOp(stack[stack.length - 1]) && (prec[stack[stack.length - 1].v] >= prec[tok.v])) {
+        out.push(stack.pop());
+      }
+      stack.push(tok);
+      continue;
+    }
+    return null;
+  }
+  while (stack.length) {
+    const x = stack.pop();
+    if (x.v === '(' || x.v === ')') return null;
+    out.push(x);
+  }
+
+  const st = [];
+  const toVal = (tok) => {
+    if (tok.t === 'num') { try { return BigInt(tok.v); } catch { return null; } }
+    if (tok.t === 'id') {
+      if (env.has(tok.v)) return env.get(tok.v);
+      return null;
+    }
+    return null;
+  };
+  for (const tok of out) {
+    if (tok.t === 'num' || tok.t === 'id') {
+      const v = toVal(tok);
+      if (v == null) return null;
+      st.push(v);
+      continue;
+    }
+    if (tok.t === 'op') {
+      const b = st.pop();
+      const a = st.pop();
+      if (a == null || b == null) return null;
+      switch (tok.v) {
+        case '+': st.push(a + b); break;
+        case '-': st.push(a - b); break;
+        case '*': st.push(a * b); break;
+        case '/': if (b === 0n) return null; st.push(a / b); break;
+        case '%': if (b === 0n) return null; st.push(a % b); break;
+        case '<<': st.push(a << b); break;
+        case '>>': st.push(a >> b); break;
+        case '&': st.push(a & b); break;
+        case '^': st.push(a ^ b); break;
+        case '|': st.push(a | b); break;
+        default: return null;
+      }
+      continue;
+    }
+    return null;
+  }
+  if (st.length !== 1) return null;
+  return st[0];
+}
+
+function buildAsmSymbolEnvUpTo(document, uptoLine) {
+  const env = new Map();
+  const max = Math.min(document.lineCount || 0, Math.max(0, uptoLine + 1));
+  for (let i = 0; i < max; i++) {
     const raw = document.lineAt(i).text;
     const line = stripAsmComments(raw).trim();
     if (!line) continue;
 
-    // Match:
-    //   .set name, 54
-    //   .equ name, 54
-    //   name = 54
-    let m = line.match(/^\s*\.(?:set|equ|equiv)\s+([A-Za-z_]\w*)\s*,\s*([+-]?(?:0x[0-9a-fA-F]+|\d+))\b/);
-    if (!m) {
-      m = line.match(/^\s*([A-Za-z_]\w*)\s*=\s*([+-]?(?:0x[0-9a-fA-F]+|\d+))\b/);
-    }
+    let m = line.match(/^\s*(?:[A-Za-z_]\w*:\s*)?\.(?:set|equ|equiv)\s+([A-Za-z_]\w*)\s*,\s*(.+)\s*$/);
+    if (!m) m = line.match(/^\s*([A-Za-z_]\w*)\s*=\s*(.+)\s*$/);
     if (!m) continue;
 
     const name = m[1];
-    const imm = parseAsmImmediate(m[2]);
-    if (name && imm != null && Number.isFinite(imm)) {
-      table.set(name, imm);
+    const rhs = String(m[2] || '').trim();
+    if (!name || !rhs) continue;
+
+    if (/^UNDEF$/i.test(rhs)) {
+      env.delete(name);
+      continue;
     }
+
+    const v = evalAsmExprBigIntWithEnv(rhs, env);
+    if (v != null) env.set(name, v);
   }
-  return table;
+  return env;
 }
 
-function getAsmSymbolTable(document) {
+function getAsmSymbolCtx(document, uptoLine) {
   const fsPath = (document.uri && document.uri.fsPath) || '';
   const v = typeof document.version === 'number' ? document.version : 0;
-  const key = `${fsPath}:${v}`;
+  const bucketSize = 512;
+  const bucket = Math.floor(Math.max(0, uptoLine || 0) / bucketSize) * bucketSize;
+  const key = `${fsPath}:${v}:${bucket}`;
   const cached = asmSymbolCache.get(key);
   if (cached) return cached;
-  const table = buildAsmSymbolTable(document);
-  asmSymbolCache.set(key, table);
+  const env = buildAsmSymbolEnvUpTo(document, bucket + bucketSize - 1);
+  const ctx = { env };
+  asmSymbolCache.set(key, ctx);
   // best-effort: keep cache bounded (avoid leaking across many generated asm files)
   if (asmSymbolCache.size > 64) {
     const firstKey = asmSymbolCache.keys().next().value;
     if (firstKey) asmSymbolCache.delete(firstKey);
   }
-  return table;
+  return ctx;
 }
 
-function resolveAsmSymbolOrNumber(document, token) {
+function resolveAsmSymbolOrNumber(document, token, uptoLine) {
   const t = String(token || '').trim();
   if (!t) return null;
-  const imm = parseAsmImmediate(t);
-  if (imm != null) return imm;
-  const table = getAsmSymbolTable(document);
-  const v = table.get(t);
-  return (typeof v === 'number' && Number.isFinite(v)) ? v : null;
+
+  const { env } = getAsmSymbolCtx(document, uptoLine || 0);
+  const v = evalAsmExprBigIntWithEnv(t, env);
+  if (v == null) return null;
+  // convert to Number (register indices are small)
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+
+  return null;
 }
 
 function extractRegisterAt(document, position) {
@@ -581,9 +933,10 @@ function extractRegisterAt(document, position) {
   const patterns = [
     // IMPORTANT: avoid regex lookbehind (older extension hosts may not support it).
     // Also avoid trailing \b for bracketed forms (`]` is not a word char, so `s[foo],` must match).
-    { type: 'rangeSym', re: /\b([sv])\[(\w+):(\w+)\]/g },
+    // allow expressions like vgprValuC+54 inside brackets
+    { type: 'rangeSym', re: /\b([sv])\[([^\]:]+):([^\]]+)\]/g },
     { type: 'range', re: /\b([sv])\[(\d+):(\d+)\]/g },
-    { type: 'singleSym', re: /\b([sv])\[(\w+)\]/g },
+    { type: 'singleSym', re: /\b([sv])\[([^\]]+)\]/g },
     { type: 'single', re: /\b([sv])(\d+)\b/g }
   ];
 
@@ -599,7 +952,7 @@ function extractRegisterAt(document, position) {
           return { kind, name, names: [name], raw: m[0] };
         }
         if (p.type === 'singleSym') {
-          const idx = resolveAsmSymbolOrNumber(document, m[2]);
+          const idx = resolveAsmSymbolOrNumber(document, m[2], position.line);
           if (idx == null) {
             return { kind, name: m[0], names: [], raw: m[0], unresolvedSymbols: [m[2]] };
           }
@@ -608,8 +961,8 @@ function extractRegisterAt(document, position) {
         }
 
         // range / rangeSym
-        const a = (p.type === 'rangeSym') ? resolveAsmSymbolOrNumber(document, m[2]) : Number(m[2]);
-        const b = (p.type === 'rangeSym') ? resolveAsmSymbolOrNumber(document, m[3]) : Number(m[3]);
+        const a = (p.type === 'rangeSym') ? resolveAsmSymbolOrNumber(document, m[2], position.line) : Number(m[2]);
+        const b = (p.type === 'rangeSym') ? resolveAsmSymbolOrNumber(document, m[3], position.line) : Number(m[3]);
         if (!Number.isFinite(a) || !Number.isFinite(b)) {
           const unresolved = [];
           if (p.type === 'rangeSym') {
@@ -1018,6 +1371,34 @@ function activate(context) {
   const spawnClient = new RocgdbMiClient(output, logger);
   const activeBackend = new ActiveCppdbgBackend(output, logger);
 
+  const cfg = vscode.workspace.getConfiguration('rocgdbHover');
+  const allowedDataTypes = ['hex', 'uint32', 'int32', 'fp32', 'bf16', 'fp16'];
+  const getHoverDataType = () => {
+    const v = context.globalState.get('hoverDataType');
+    if (typeof v === 'string' && allowedDataTypes.includes(v)) return v;
+    const d = cfg.get('defaultHoverDataType') || 'hex';
+    if (typeof d === 'string' && allowedDataTypes.includes(d)) return d;
+    return 'hex';
+  };
+  const setHoverDataType = async (t) => {
+    if (typeof t !== 'string' || !allowedDataTypes.includes(t)) return;
+    await context.globalState.update('hoverDataType', t);
+  };
+
+  // Hover copy support: store last hover payloads (id -> text) so we don't embed huge text in command URIs.
+  const hoverCopyCache = new Map(); // id -> {ts, text}
+  let hoverCopySeq = 0;
+  const putHoverCopy = (text) => {
+    const id = `${Date.now()}-${(++hoverCopySeq)}`;
+    hoverCopyCache.set(id, { ts: Date.now(), text: String(text || '') });
+    // bound cache size
+    if (hoverCopyCache.size > 64) {
+      const firstKey = hoverCopyCache.keys().next().value;
+      if (firstKey) hoverCopyCache.delete(firstKey);
+    }
+    return id;
+  };
+
   const getBackend = () => {
     const cfg = vscode.workspace.getConfiguration('rocgdbHover');
     const backend = cfg.get('backend') || 'auto';
@@ -1083,6 +1464,27 @@ function activate(context) {
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand('rocgdbHover.pickDataType', async () => {
+      const current = getHoverDataType();
+      const picked = await vscode.window.showQuickPick(
+        allowedDataTypes.map((t) => ({ label: t, description: (t === current) ? 'current' : '' })),
+        { title: 'rocgdbHover: Hover data type' }
+      );
+      if (!picked) return;
+      await setHoverDataType(picked.label);
+    }),
+    vscode.commands.registerCommand('rocgdbHover.setDataType', async (t) => {
+      await setHoverDataType(t);
+    }),
+    vscode.commands.registerCommand('rocgdbHover.copyHover', async (id) => {
+      const rec = hoverCopyCache.get(String(id || ''));
+      if (!rec || !rec.text) return;
+      await vscode.env.clipboard.writeText(rec.text);
+      vscode.window.setStatusBarMessage('rocgdbHover: copied hover text', 1500);
+    })
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand('rocgdbHover.openLog', async () => {
       const cfg = vscode.workspace.getConfiguration('rocgdbHover');
       const logFile = cfg.get('logFile') || '';
@@ -1134,7 +1536,8 @@ function activate(context) {
         const key = `${reg.kind}:${reg.name}`;
         // Backward compat: older code used reg.name; now we store reg.names
         // Use a stable cache key for both single and range.
-        const cacheKey = `${reg.kind}:${(reg.names || []).join(',')}`;
+        const dt = getHoverDataType();
+        const cacheKey = `${reg.kind}:${(reg.names || []).join(',')}:${dt}`;
         const now = Date.now();
         const cached = cache.get(cacheKey);
         if (cached && now - cached.ts < cacheTtlMs) {
@@ -1152,12 +1555,48 @@ function activate(context) {
 
         const p = (async () => {
           try {
+            const dt = getHoverDataType();
+            const mdHeader = new vscode.MarkdownString();
+            const hoverSticky = vscode.workspace.getConfiguration('editor').get('hover.sticky');
+            const tip = hoverSticky ? '' : ' (tip: set `editor.hover.sticky=true` to keep this open)';
+            const copyId = putHoverCopy(''); // placeholder, will be updated per-hover below
+            const copyLink = `[copy](command:rocgdbHover.copyHover?${encodeCommandArgs([copyId])})`;
+            const links =
+              allowedDataTypes
+                .map((t) => {
+                  const arg = encodeCommandArgs([t]);
+                  const label = (t === dt) ? `**${t}**` : t;
+                  return `[${label}](command:rocgdbHover.setDataType?${arg})`;
+                })
+                .join(' | ') +
+              ` | [pick…](command:rocgdbHover.pickDataType)`;
+            mdHeader.appendMarkdown(`Data type: ${links} | ${copyLink}${tip}\n\n`);
+            mdHeader.isTrusted = true;
+
             if (reg.kind === 'sgpr') {
               const names = reg.names || [];
+              if (names.length === 0) {
+                const md = new vscode.MarkdownString();
+                md.appendMarkdown(mdHeader.value);
+                md.appendMarkdown(`**${reg.raw || reg.name}**\n\n`);
+                if (reg.unresolvedSymbols && reg.unresolvedSymbols.length) {
+                  md.appendMarkdown(`Unresolved symbols: \`${reg.unresolvedSymbols.join('`, `')}\``);
+                } else {
+                  md.appendMarkdown(`Could not resolve this register expression.`);
+                }
+                md.isTrusted = true;
+                hoverCopyCache.set(copyId, { ts: Date.now(), text: `Data type: ${dt}\n${reg.raw || reg.name}\n(unresolved)` });
+                return new vscode.Hover(md);
+              }
               if (names.length === 1) {
                 const val = await readSgpr(b, names[0]);
                 const md = new vscode.MarkdownString();
-                md.appendMarkdown(`**${names[0]}** = \`${val ?? 'N/A'}\``);
+                md.appendMarkdown(mdHeader.value);
+                const u = toUint32FromValueString(val);
+                const shown = (u == null) ? (val ?? 'N/A') : formatUint32AsType(u, dt);
+                md.appendMarkdown(`**${names[0]}** = \`${shown}\``);
+                md.isTrusted = true;
+                hoverCopyCache.set(copyId, { ts: Date.now(), text: `Data type: ${dt}\n${names[0]} = ${shown}` });
                 const hover = new vscode.Hover(md);
                 cache.set(cacheKey, { ts: Date.now(), value: hover });
                 return hover;
@@ -1166,10 +1605,18 @@ function activate(context) {
               // Range / multiple SGPRs
               const vals = await readSgprMany(b, names);
               const md = new vscode.MarkdownString();
+              md.appendMarkdown(mdHeader.value);
               const title = reg.range ? `s[${reg.range.lo}:${reg.range.hi}]` : names.join(', ');
               md.appendMarkdown(`**${title}**\n\n`);
+              const plainLines = [];
               md.appendCodeblock(
-                names.map((n, i) => `${n} = ${vals[i] ?? 'N/A'}`).join('\n'),
+                names.map((n, i) => {
+                  const raw = vals[i];
+                  const u = toUint32FromValueString(raw);
+                  const shown = (u == null) ? (raw ?? 'N/A') : formatUint32AsType(u, dt);
+                  plainLines.push(`${n} = ${shown}`);
+                  return `${n} = ${shown}`;
+                }).join('\n'),
                 'text'
               );
               if (names.length === 2) {
@@ -1178,24 +1625,52 @@ function activate(context) {
                   md.appendMarkdown(`\nCombined 64-bit: \`${combined}\``);
                 }
               }
+              md.isTrusted = true;
+              hoverCopyCache.set(copyId, { ts: Date.now(), text: `Data type: ${dt}\n${title}\n` + plainLines.join('\n') });
               const hover = new vscode.Hover(md);
               cache.set(cacheKey, { ts: Date.now(), value: hover });
               return hover;
             }
 
             const names = reg.names || [];
+            if (names.length === 0) {
+              const md = new vscode.MarkdownString();
+              md.appendMarkdown(mdHeader.value);
+              md.appendMarkdown(`**${reg.raw || reg.name}**\n\n`);
+              if (reg.unresolvedSymbols && reg.unresolvedSymbols.length) {
+                md.appendMarkdown(`Unresolved symbols: \`${reg.unresolvedSymbols.join('`, `')}\``);
+              } else {
+                md.appendMarkdown(`Could not resolve this register expression.`);
+              }
+              md.isTrusted = true;
+              hoverCopyCache.set(copyId, { ts: Date.now(), text: `Data type: ${dt}\n${reg.raw || reg.name}\n(unresolved)` });
+              return new vscode.Hover(md);
+            }
             if (names.length === 1) {
               const r = await readVgpr(b, names[0]);
               const md = new vscode.MarkdownString();
+              md.appendMarkdown(mdHeader.value);
               if (r && r.kind === 'vector') {
                 md.appendMarkdown(`**${names[0]}** (lanes 0..${r.values.length - 1})\n\n`);
+                const plainLines = [];
                 md.appendCodeblock(
-                  r.values.map((v, i) => `[${String(i).padStart(2, ' ')}] ${v ?? 'N/A'}`).join('\n'),
+                  r.values.map((v, i) => {
+                    const u = toUint32FromValueString(v);
+                    const shown = (u == null) ? (v ?? 'N/A') : formatUint32AsType(u, dt);
+                    plainLines.push(`[${String(i).padStart(2, ' ')}] ${shown}`);
+                    return `[${String(i).padStart(2, ' ')}] ${shown}`;
+                  }).join('\n'),
                   'text'
                 );
+                hoverCopyCache.set(copyId, { ts: Date.now(), text: `Data type: ${dt}\n${names[0]} (lanes)\n` + plainLines.join('\n') });
               } else {
-                md.appendMarkdown(`**${names[0]}** = \`${(r && r.value) ?? 'N/A'}\``);
+                const raw = r && r.value;
+                const u = toUint32FromValueString(raw);
+                const shown = (u == null) ? (raw ?? 'N/A') : formatUint32AsType(u, dt);
+                md.appendMarkdown(`**${names[0]}** = \`${shown}\``);
+                hoverCopyCache.set(copyId, { ts: Date.now(), text: `Data type: ${dt}\n${names[0]} = ${shown}` });
               }
+              md.isTrusted = true;
               const hover = new vscode.Hover(md);
               cache.set(cacheKey, { ts: Date.now(), value: hover });
               return hover;
@@ -1211,20 +1686,32 @@ function activate(context) {
             }
 
             const blocks = [];
+            const plainBlocks = [];
             for (const n of names) {
               const r = await readVgpr(b, n);
               if (r && r.kind === 'vector') {
-                blocks.push(
-                  `${n}\n${r.values.map((v, i) => `[${String(i).padStart(2, ' ')}] ${v ?? 'N/A'}`).join('\n')}`
-                );
+                const lines = r.values.map((v, i) => {
+                    const u = toUint32FromValueString(v);
+                    const shown = (u == null) ? (v ?? 'N/A') : formatUint32AsType(u, dt);
+                    return `[${String(i).padStart(2, ' ')}] ${shown}`;
+                  }).join('\n');
+                blocks.push(`${n}\n${lines}`);
+                plainBlocks.push(`${n}\n${lines}`);
               } else {
-                blocks.push(`${n} = ${(r && r.value) ?? 'N/A'}`);
+                const raw = r && r.value;
+                const u = toUint32FromValueString(raw);
+                const shown = (u == null) ? (raw ?? 'N/A') : formatUint32AsType(u, dt);
+                blocks.push(`${n} = ${shown}`);
+                plainBlocks.push(`${n} = ${shown}`);
               }
             }
             const md = new vscode.MarkdownString();
+            md.appendMarkdown(mdHeader.value);
             const title = reg.range ? `v[${reg.range.lo}:${reg.range.hi}]` : names.join(', ');
             md.appendMarkdown(`**${title}**\n\n`);
             md.appendCodeblock(blocks.join('\n\n'), 'text');
+            md.isTrusted = true;
+            hoverCopyCache.set(copyId, { ts: Date.now(), text: `Data type: ${dt}\n${title}\n` + plainBlocks.join('\n\n') });
             const hover = new vscode.Hover(md);
             cache.set(cacheKey, { ts: Date.now(), value: hover });
             return hover;

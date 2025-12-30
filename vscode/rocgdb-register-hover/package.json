@@ -32,6 +32,18 @@
       {
         "command": "rocgdbHover.openLog",
         "title": "rocgdbHover: Open log file"
+      },
+      {
+        "command": "rocgdbHover.pickDataType",
+        "title": "rocgdbHover: Pick hover data type"
+      },
+      {
+        "command": "rocgdbHover.setDataType",
+        "title": "rocgdbHover: Set hover data type"
+      },
+      {
+        "command": "rocgdbHover.copyHover",
+        "title": "rocgdbHover: Copy hover text"
       }
     ],
     "configuration": {
@@ -116,6 +128,12 @@
           "type": "string",
           "default": "(gpu|amdgpu|hsa|dispatch|queue|wave|lane)",
           "description": "Regex (case-insensitive) used to identify GPU-like threads in `info threads` output when autoSelectGpuThread is enabled."
+        },
+        "rocgdbHover.defaultHoverDataType": {
+          "type": "string",
+          "default": "hex",
+          "enum": ["hex", "uint32", "int32", "fp32", "bf16", "fp16"],
+          "description": "Default data type used to format register values in hover."
         }
       }
     }
