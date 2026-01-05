@@ -125,4 +125,46 @@ swcu 0        # CU0, W0
 swcu 0 2      # CU0, W2
 ```
 
+### Compute LDS addresses per-lane (`addr`)
+
+`addr` computes **per-CU / per-wave / per-lane** addresses for LDS ops at the current stop location.
+
+Initial support:
+
+- **`ds_read_*`**: address = `vaddr + offset`
+- **`ds_write_*`**: address = `vaddr + offset`
+
+#### `addr` syntax
+
+Two typical forms:
+
+- `addr` (infer op/vaddr/offset/bytes from the current `.s` line; requires you to be stopped on a `ds_read_*`/`ds_write_*` instruction line)
+- `addr ds_read|ds_write <vaddr-expr> [--offset N] [--bytes N] ...` (override / don’t rely on source-line parsing)
+
+Common filters / formatting:
+
+- `--cu ID` (repeatable)
+- `--max-cu N`
+- `--wave 0-3` / `--wave 0,2`
+- `--lane N` or `--lane LO-HI`
+- `--hex` / `--dec`
+- `--out PATH`
+
+Examples:
+
+```gdb
+# Stopped at: ds_read_b128 ... v[vgprLocalReadAddrA] offset:0
+addr
+
+# Stopped at: ds_write_b128 v[vgprLocalWriteAddrB], ... offset:0
+addr
+
+# Explicit:
+addr ds_read  vgprLocalReadAddrA  --offset 0 --bytes 16
+addr ds_write vgprLocalWriteAddrB --offset 0 --bytes 16
+
+# Only show CU0, waves W2/W3, lanes 0-15:
+addr --cu 0 --wave 2-3 --lane 0-15
+```
+
 

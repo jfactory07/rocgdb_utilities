@@ -10,6 +10,14 @@
 #       You can omit the leading '$' for register-like tokens (e.g. `reg sgprWorkGroup0`, `reg v192`).
 #       For SGPR/VGPR ($sgpr*/$vgpr*/$sN/$vN), default is decimal integer output (use --hex to override).
 #
+#   - addr [ds_read|ds_write] [<vaddr-expr>] [--offset N] [--bytes N] [--cu ID]... [--max-cu N]
+#           [--wave W|W0-W1|W0,W1,...] [--lane N|LO-HI] [--hex|--dec] [--out PATH] [--debug]
+#       Compute per-CU/per-wave/per-lane addresses for LDS ops at the current stop location.
+#       If stopped on a Tensile `.s` ds_read/ds_write line, you can run `addr` with no args.
+#
+#   - swcu <cu> [w]
+#       Switch to a wave on a given CU (W0..W3 as mapped from `info threads` per-CU slot order).
+#
 #   - lds <offset> [count] [hex|fp16|bf16|fp32] [--out PATH]
 #       Dump LDS (local address space) with optional decoding.
 #
@@ -1005,6 +1013,607 @@ Examples:
 
 
 SwCuCommand()
+
+#
+# Address helpers (per-CU / per-wave / per-lane)
+#   - addr [ds_read] [<vaddr-expr>] [--offset N] [--bytes N] [--cu ID]... [--max-cu N] [--wave ...] [--lane N|LO-HI] [--hex|--dec] [--out PATH]
+#
+
+def _strip_asm_comment(s: str) -> str:
+    try:
+        return s.split("//", 1)[0].strip()
+    except Exception:
+        return (s or "").strip()
+
+
+def _read_file_line_1based(path: str, line_no: int):
+    """Return the 1-based line content from `path`, or None."""
+    try:
+        if not path or line_no is None or int(line_no) <= 0:
+            return None
+        n = int(line_no)
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f, start=1):
+                if i == n:
+                    return line.rstrip("\n")
+        return None
+    except Exception:
+        return None
+
+
+def _selected_source_location():
+    """Return (fullname, line_no) for selected frame, or (None, None)."""
+    try:
+        fr = gdb.selected_frame()
+        if fr is None:
+            return None, None
+        sal = fr.find_sal()
+        if sal is None or sal.symtab is None:
+            return None, None
+        try:
+            fn = sal.symtab.fullname()
+        except Exception:
+            fn = sal.symtab.filename
+        return (str(fn) if fn else None), getattr(sal, "line", None)
+    except Exception:
+        return None, None
+
+
+def _parse_ds_read_asm_line(line: str):
+    """
+    Parse a Tensile asm line and extract ds_read fields.
+
+    Returns dict with keys:
+      - opcode: str
+      - bytes: int|None
+      - offset: int
+      - vaddr_expr: str
+    """
+    s = _strip_asm_comment(line or "")
+    if not s:
+        return None
+
+    m = re.match(r"^\s*(?P<op>ds_read[0-9A-Za-z_\.]*)\b", s)
+    if not m:
+        return None
+    op = m.group("op")
+
+    # Offset immediate (bytes)
+    off = 0
+    mo = re.search(r"\boffset\s*:\s*(?P<imm>0x[0-9a-fA-F]+|-?\d+)\b", s)
+    if mo:
+        try:
+            off = int(mo.group("imm"), 0)
+        except Exception:
+            off = 0
+
+    # Size (bytes) from _bNNN suffix (bits)
+    nbytes = None
+    mb = re.search(r"_b(?P<bits>\d+)\b", op)
+    if mb:
+        try:
+            bits = int(mb.group("bits"), 10)
+            if bits % 8 == 0:
+                nbytes = bits // 8
+        except Exception:
+            nbytes = None
+
+    # Best-effort: vaddr is the last comma-separated operand, before "offset:"
+    parts = s.split(",")
+    if len(parts) < 2:
+        return None
+    addr_part = parts[-1]
+    addr_part = re.split(r"\boffset\b", addr_part, maxsplit=1)[0].strip()
+    # ds_read ... , v[foo]  => foo
+    mva = re.match(r"^\s*v\[(?P<inner>.*)\]\s*$", addr_part)
+    if mva:
+        vaddr_expr = mva.group("inner").strip()
+    else:
+        vaddr_expr = addr_part
+
+    if not vaddr_expr:
+        return None
+    return {"opcode": op, "bytes": nbytes, "offset": off, "vaddr_expr": vaddr_expr}
+
+
+def _parse_ds_write_asm_line(line: str):
+    """
+    Parse a Tensile asm line and extract ds_write fields.
+
+    Returns dict with keys:
+      - opcode: str
+      - bytes: int|None
+      - offset: int
+      - vaddr_expr: str
+    """
+    s = _strip_asm_comment(line or "")
+    if not s:
+        return None
+
+    m = re.match(r"^\s*(?P<op>ds_write[0-9A-Za-z_\.]*)\b", s)
+    if not m:
+        return None
+    op = m.group("op")
+
+    # Offset immediate (bytes)
+    off = 0
+    mo = re.search(r"\boffset\s*:\s*(?P<imm>0x[0-9a-fA-F]+|-?\d+)\b", s)
+    if mo:
+        try:
+            off = int(mo.group("imm"), 0)
+        except Exception:
+            off = 0
+
+    # Size (bytes) from _bNNN suffix (bits)
+    nbytes = None
+    mb = re.search(r"_b(?P<bits>\d+)\b", op)
+    if mb:
+        try:
+            bits = int(mb.group("bits"), 10)
+            if bits % 8 == 0:
+                nbytes = bits // 8
+        except Exception:
+            nbytes = None
+
+    # For ds_write, vaddr is the first operand after opcode:
+    #   ds_write_b128 v[vgprLocalWriteAddrB], v[...data...] offset:0
+    parts = s.split(",")
+    if not parts:
+        return None
+    first = parts[0].strip()
+    # Strip opcode token and keep the rest
+    m1 = re.match(r"^\s*ds_write[0-9A-Za-z_\.]*\s+(?P<opnd>.+?)\s*$", first)
+    if not m1:
+        return None
+    addr_part = m1.group("opnd").strip()
+    mva = re.match(r"^\s*v\[(?P<inner>.*)\]\s*$", addr_part)
+    vaddr_expr = (mva.group("inner").strip() if mva else addr_part)
+    if not vaddr_expr:
+        return None
+
+    return {"opcode": op, "bytes": nbytes, "offset": off, "vaddr_expr": vaddr_expr}
+
+
+def _addr_parse_wave_threads():
+    """
+    Parse `info threads` and return list[(tid:int, cu:int, slot:int, thread_obj)].
+    """
+    try:
+        out = gdb.execute("info threads", to_string=True)
+    except (gdb.error, gdb.MemoryError) as e:
+        raise gdb.GdbError(f"addr: cannot run `info threads`: {e}")
+
+    inf = gdb.selected_inferior()
+    threads = list(inf.threads())
+    num_to_thread = {}
+    for t in threads:
+        try:
+            num_to_thread[int(getattr(t, "num", -1))] = t
+        except Exception:
+            continue
+
+    # Match AMDGPU wave lines; allow spaces inside "(CU, 0, 0)/slot".
+    pat = re.compile(
+        r"^\s*\*?\s*(\d+)\s+AMDGPU\s+Wave\b.*\(\s*(\d+)\s*,\s*\d+\s*,\s*\d+\s*\)/\s*(\d+)\b",
+        re.IGNORECASE,
+    )
+
+    entries = []
+    for line in out.splitlines():
+        m = pat.match(line)
+        if not m:
+            continue
+        tid = int(m.group(1))
+        cu = int(m.group(2))
+        slot = int(m.group(3))
+        t = num_to_thread.get(tid)
+        if t is None:
+            continue
+        entries.append((tid, cu, slot, t))
+    return entries
+
+
+def _addr_slots_to_waves(entries):
+    """
+    Build per-CU slot->W mapping by sorting slots.
+    Returns dict[cu][slot] = wave_index (0..3), and dict[cu] -> sorted slots.
+    """
+    cu_to_slots = {}
+    for _tid, cu, slot, _t in entries:
+        cu_to_slots.setdefault(cu, set()).add(int(slot))
+    cu_slot_to_w = {}
+    cu_sorted_slots = {}
+    for cu, slots_set in cu_to_slots.items():
+        slots = sorted(slots_set)
+        cu_sorted_slots[cu] = slots
+        m = {}
+        for wi in range(min(4, len(slots))):
+            m[slots[wi]] = wi
+        cu_slot_to_w[cu] = m
+    return cu_slot_to_w, cu_sorted_slots
+
+
+def _addr_format_u32(iv: int, out_hex: bool) -> str:
+    try:
+        v = int(iv) & 0xFFFFFFFF
+    except Exception:
+        return "ERR"
+    return (f"0x{v:08x}" if out_hex else str(v))
+
+
+class AddrCommand(gdb.Command):
+    """addr [ds_read|ds_write] [<vaddr-expr>] [--offset N] [--bytes N] [--cu ID]... [--max-cu N] [--wave W|W0-W1|W0,W1,...] [--lane N|LO-HI] [--hex|--dec] [--out PATH] [--debug]
+
+Compute per-CU/per-wave/per-lane addresses for memory ops.
+
+Initial support:
+  - ds_read: LDS read address = vaddr + offset (per lane)
+  - ds_write: LDS write address = vaddr + offset (per lane)
+
+Common use:
+  - stop at a ds_read_* line in a Tensile `.s`, then:
+      (gdb) addr
+    or:
+      (gdb) addr ds_read
+    or override operands:
+      (gdb) addr ds_read vgprLocalReadAddrA --offset 0 --bytes 16
+"""
+
+    def __init__(self):
+        super().__init__("addr", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        argv = gdb.string_to_argv(arg)
+        out_path, argv = _parse_out_arg(argv)
+        wout = _TeeWriter(out_path)
+
+        _refresh_autogen_map_if_needed()
+
+        debug = False
+        out_hex = True
+        max_cu = None
+        cu_filter = []
+        wave_cols = [0, 1, 2, 3]
+        lane_idx = None
+        lane_lo = None
+        lane_hi = None
+        off_override = None
+        bytes_override = None
+
+        def _dbg(msg: str):
+            if debug:
+                wout.write("[addr:debug] " + msg + "\n")
+
+        def _add_w(v: int, picked):
+            if v < 0 or v > 3:
+                raise ValueError("wave out of range")
+            if v not in picked:
+                picked.append(v)
+
+        # Parse subcommand / implicit ds_read from current source line.
+        sub = None
+        expr = None
+        ds_meta = None
+
+        # If first token is a known subcommand, consume it.
+        if argv and argv[0] in ("ds_read", "ds_write"):
+            sub = argv[0]
+            argv = argv[1:]
+
+        # If an expr is provided, take it (before flags).
+        if argv and not argv[0].startswith("--"):
+            expr = argv[0]
+            argv = argv[1:]
+
+        i = 0
+        while i < len(argv):
+            a = argv[i]
+            if a == "--debug":
+                debug = True
+                i += 1
+                continue
+            if a == "--hex":
+                out_hex = True
+                i += 1
+                continue
+            if a == "--dec":
+                out_hex = False
+                i += 1
+                continue
+            if a == "--max-cu" and i + 1 < len(argv):
+                try:
+                    max_cu = int(argv[i + 1], 0)
+                except Exception:
+                    raise gdb.GdbError(f"addr: invalid --max-cu value: {argv[i+1]}")
+                i += 2
+                continue
+            if a == "--cu" and i + 1 < len(argv):
+                try:
+                    cu_filter.append(int(argv[i + 1], 0))
+                except Exception:
+                    raise gdb.GdbError(f"addr: invalid --cu value: {argv[i+1]}")
+                i += 2
+                continue
+            if a == "--wave" and i + 1 < len(argv):
+                s = argv[i + 1]
+                picked = []
+                try:
+                    for part in s.split(","):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        if "-" in part:
+                            lo_s, hi_s = part.split("-", 1)
+                            lo = int(lo_s, 0)
+                            hi = int(hi_s, 0)
+                            if hi < lo:
+                                raise ValueError("wave range hi < lo")
+                            for v in range(lo, hi + 1):
+                                _add_w(v, picked)
+                        else:
+                            _add_w(int(part, 0), picked)
+                except Exception:
+                    raise gdb.GdbError(f"addr: invalid --wave value: {s} (use W, LO-HI, or comma list; W in 0..3)")
+                if not picked:
+                    raise gdb.GdbError("addr: --wave requires at least one wave index (0..3)")
+                wave_cols = picked
+                i += 2
+                continue
+            if a == "--lane" and i + 1 < len(argv):
+                s = argv[i + 1]
+                try:
+                    if "-" in s:
+                        lo_s, hi_s = s.split("-", 1)
+                        lane_lo = int(lo_s, 0)
+                        lane_hi = int(hi_s, 0)
+                        if lane_hi < lane_lo:
+                            raise ValueError("lane range hi < lo")
+                        lane_idx = None
+                    else:
+                        lane_idx = int(s, 0)
+                        lane_lo = None
+                        lane_hi = None
+                except Exception:
+                    raise gdb.GdbError(f"addr: invalid --lane value: {s} (use N or LO-HI)")
+                i += 2
+                continue
+            if a == "--offset" and i + 1 < len(argv):
+                try:
+                    off_override = int(argv[i + 1], 0)
+                except Exception:
+                    raise gdb.GdbError(f"addr: invalid --offset value: {argv[i+1]}")
+                i += 2
+                continue
+            if a == "--bytes" and i + 1 < len(argv):
+                try:
+                    bytes_override = int(argv[i + 1], 0)
+                except Exception:
+                    raise gdb.GdbError(f"addr: invalid --bytes value: {argv[i+1]}")
+                i += 2
+                continue
+            raise gdb.GdbError(f"addr: unknown option: {a}")
+
+        # If no expr/subcommand, attempt to parse current asm line and infer ds_*.
+        if sub is None and expr is None:
+            fn, ln = _selected_source_location()
+            if fn is None or ln is None:
+                wout.write("Usage: addr [ds_read|ds_write] [<vaddr-expr>] [--offset N] [--bytes N] [--cu ID]... [--max-cu N] [--wave ...] [--lane N|LO-HI] [--hex|--dec] [--out PATH]\n")
+                wout.write("Hint: stop in a Tensile `.s` ds_* line and run `addr`, or pass `addr ds_read|ds_write <vaddr-expr>`.\n")
+                wout.close()
+                return
+            src = _read_file_line_1based(fn, ln)
+            ds_meta = _parse_ds_read_asm_line(src or "")
+            if ds_meta:
+                sub = "ds_read"
+                expr = ds_meta["vaddr_expr"]
+            else:
+                ds_meta = _parse_ds_write_asm_line(src or "")
+                if ds_meta:
+                    sub = "ds_write"
+                    expr = ds_meta["vaddr_expr"]
+                else:
+                    wout.write(f"addr: could not infer ds_read/ds_write from current line {fn}:{ln}\n")
+                    wout.write("Hint: use `addr ds_read|ds_write <vaddr-expr> --offset N --bytes N`.\n")
+                    wout.close()
+                    return
+
+        # If user asked ds_read but didn't provide expr, try infer from current line.
+        if sub == "ds_read" and expr is None:
+            fn, ln = _selected_source_location()
+            src = _read_file_line_1based(fn, ln) if fn and ln else None
+            ds_meta = _parse_ds_read_asm_line(src or "")
+            if not ds_meta:
+                raise gdb.GdbError("addr ds_read: need <vaddr-expr> or stop at a ds_read_* asm line.")
+            expr = ds_meta["vaddr_expr"]
+
+        # If user asked ds_write but didn't provide expr, try infer from current line.
+        if sub == "ds_write" and expr is None:
+            fn, ln = _selected_source_location()
+            src = _read_file_line_1based(fn, ln) if fn and ln else None
+            ds_meta = _parse_ds_write_asm_line(src or "")
+            if not ds_meta:
+                raise gdb.GdbError("addr ds_write: need <vaddr-expr> or stop at a ds_write_* asm line.")
+            expr = ds_meta["vaddr_expr"]
+
+        if sub is None:
+            # Default to ds_read for now (future: buffer_*)
+            sub = "ds_read"
+
+        if sub not in ("ds_read", "ds_write"):
+            wout.close()
+            raise gdb.GdbError(f"addr: unsupported subcommand: {sub}")
+
+        # Finalize offset/bytes from inferred line (if any) and overrides.
+        if ds_meta is None:
+            fn, ln = _selected_source_location()
+            src = _read_file_line_1based(fn, ln) if fn and ln else None
+            if src:
+                ds_meta = _parse_ds_read_asm_line(src or "")
+                if not ds_meta:
+                    ds_meta = _parse_ds_write_asm_line(src or "")
+            else:
+                ds_meta = None
+
+        off = off_override if off_override is not None else (ds_meta["offset"] if ds_meta else 0)
+        nbytes = bytes_override if bytes_override is not None else (ds_meta["bytes"] if ds_meta else None)
+        opcode = ds_meta["opcode"] if (ds_meta and "opcode" in ds_meta) else "ds_read"
+
+        expr0 = _normalize_reg_expr(expr)
+        eval_expr = _rewrite_expr_via_autogen_map(expr0)
+        _dbg(f"expr={expr0} eval_expr={eval_expr} off={off} bytes={nbytes}")
+
+        # Collect wave threads + map slots to W indices.
+        entries = _addr_parse_wave_threads()
+        if not entries:
+            wout.write("addr: no AMDGPU wave threads found in `info threads`\n")
+            wout.close()
+            return
+
+        # Filter entries by CUs if requested.
+        if cu_filter:
+            entries = [e for e in entries if e[1] in cu_filter]
+
+        cu_slot_to_w, _cu_slots = _addr_slots_to_waves(entries)
+        # Keep only entries that map into W0..W3
+        mapped = []
+        for tid, cu, slot, t in entries:
+            widx = cu_slot_to_w.get(cu, {}).get(slot, None)
+            if widx is None:
+                continue
+            if widx in wave_cols:
+                mapped.append((tid, cu, widx, slot, t))
+
+        if not mapped:
+            wout.write("addr: no matching waves after filtering (check --cu/--wave)\n")
+            wout.close()
+            return
+
+        # Limit max CUs if requested.
+        if max_cu is not None and max_cu >= 0:
+            seen = []
+            seen_set = set()
+            # preserve cu_filter order, else sorted
+            cu_order = [cu for cu in cu_filter if cu in set(c for _tid, c, _w, _slot, _t in mapped)] if cu_filter else sorted(set(c for _tid, c, _w, _slot, _t in mapped))
+            for cu in cu_order:
+                if cu not in seen_set:
+                    seen.append(cu)
+                    seen_set.add(cu)
+                if len(seen) >= max_cu:
+                    break
+            allowed = set(seen)
+            mapped = [x for x in mapped if x[1] in allowed]
+
+        # Preserve current thread selection
+        try:
+            cur_thread = gdb.selected_thread()
+        except Exception:
+            cur_thread = None
+
+        # Evaluate per thread and capture lane addresses.
+        results = {}  # (cu,widx) -> ("LANES",(lines,lo,hi)) | ("CELL",str) | ("ERR",msg)
+
+        def _capture_addrs(v):
+            # Determine lane bounds
+            if _is_array_value(v) and lane_idx is None:
+                try:
+                    lo0, hi0 = v.type.range()
+                    lo0, hi0 = int(lo0), int(hi0)
+                except Exception:
+                    lo0, hi0 = 0, -1
+                if lane_lo is not None and lane_hi is not None:
+                    lo_use = max(lo0, int(lane_lo))
+                    hi_use = min(hi0, int(lane_hi))
+                else:
+                    lo_use, hi_use = lo0, hi0
+                if hi_use < lo_use:
+                    return ("LANES", ([], lo_use, hi_use))
+                parts = []
+                for i0 in range(lo_use, hi_use + 1):
+                    try:
+                        base = _intish_value(v[i0], lane_idx=None)
+                        if base is None:
+                            parts.append("ERR")
+                        else:
+                            addr = (int(base) + int(off)) & 0xFFFFFFFF
+                            parts.append(_addr_format_u32(addr, out_hex))
+                    except Exception:
+                        parts.append("ERR")
+                lines = []
+                per_line = 16
+                for base_i in range(0, len(parts), per_line):
+                    lines.append(" ".join(parts[base_i:base_i + per_line]))
+                return ("LANES", (lines, lo_use, hi_use))
+
+            # Scalar or lane-selected.
+            try:
+                iv = _intish_value(v, lane_idx=lane_idx)
+                if iv is None:
+                    return ("CELL", "ERR")
+                addr = (int(iv) + int(off)) & 0xFFFFFFFF
+                return ("CELL", _addr_format_u32(addr, out_hex))
+            except Exception:
+                return ("CELL", "ERR")
+
+        for tid, cu, widx, slot, t in mapped:
+            try:
+                t.switch()
+                try:
+                    f = gdb.newest_frame()
+                    if f is not None:
+                        f.select()
+                except Exception:
+                    pass
+                v = gdb.parse_and_eval(eval_expr)
+                results[(cu, widx)] = _capture_addrs(v)
+            except (gdb.error, gdb.MemoryError) as e:
+                results[(cu, widx)] = ("ERR", str(e))
+
+        # Restore selection
+        try:
+            if cur_thread is not None:
+                cur_thread.switch()
+        except Exception:
+            pass
+
+        # Print header
+        mode = "hex" if out_hex else "dec"
+        bytes_s = str(nbytes) if nbytes is not None else "?"
+        wout.write(f"addr: {sub} {opcode} vaddr={expr0} offset={off} bytes={bytes_s} ({mode})\n")
+        wout.write("CU  W   lanes\n")
+        wout.write("--  --  -----\n")
+
+        cu_list = [cu for cu in cu_filter if cu in set(c for (c, _w) in results.keys())] if cu_filter else sorted(set(c for (c, _w) in results.keys()))
+        for cu in cu_list:
+            for w in wave_cols:
+                captured = results.get((cu, w), None)
+                if captured is None:
+                    wout.write(f"{cu:<3d} W{w} NA\n")
+                    continue
+                if isinstance(captured, tuple) and len(captured) == 2 and captured[0] == "ERR":
+                    wout.write(f"{cu:<3d} W{w} ERR: {captured[1]}\n")
+                    continue
+                kind, payload = captured
+                if kind == "CELL":
+                    # Single lane or scalar
+                    lane_tag = f"lane={lane_idx}" if lane_idx is not None else "lane=?"
+                    wout.write(f"{cu:<3d} W{w} {lane_tag} {payload}\n")
+                    continue
+                if kind == "LANES":
+                    lines, lo0, hi0 = payload
+                    for li, s in enumerate(lines):
+                        lo_lane = lo0 + li * 16
+                        hi_lane = min(lo_lane + 15, hi0)
+                        prefix = f"{cu:<3d} W{w}" if li == 0 else " " * 6
+                        wout.write(f"{prefix} [{lo_lane:02d}-{hi_lane:02d}] {s}\n")
+                    if not lines:
+                        wout.write(f"{cu:<3d} W{w} [--] (no lanes)\n")
+                    continue
+                wout.write(f"{cu:<3d} W{w} ERR\n")
+
+        wout.close()
+
+
+AddrCommand()
 
 #
 # Memory dump helpers (shared across kernels)
