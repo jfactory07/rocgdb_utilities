@@ -125,14 +125,16 @@ swcu 0        # CU0, W0
 swcu 0 2      # CU0, W2
 ```
 
-### Compute LDS addresses per-lane (`addr`)
+### Compute addresses per-lane (`addr`)
 
-`addr` computes **per-CU / per-wave / per-lane** addresses for LDS ops at the current stop location.
+`addr` computes **per-CU / per-wave / per-lane** addresses at the current stop location.
 
 Initial support:
 
 - **`ds_read_*`**: address = `vaddr + offset`
 - **`ds_write_*`**: address = `vaddr + offset`
+- **`buffer_load_*`** (offen): address = `base64(SRD[0:1]) + vaddr + soffset + offset`
+- **`buffer_store_*`** (offen): address = `base64(SRD[0:1]) + vaddr + soffset + offset`
 
 #### `addr` syntax
 
@@ -140,6 +142,7 @@ Two typical forms:
 
 - `addr` (infer op/vaddr/offset/bytes from the current `.s` line; requires you to be stopped on a `ds_read_*`/`ds_write_*` instruction line)
 - `addr ds_read|ds_write <vaddr-expr> [--offset N] [--bytes N] ...` (override / don’t rely on source-line parsing)
+- `addr buffer_load|buffer_store <vaddr-expr> --base <sgprSrdBase> [--soffset <expr>] [--offset N] [--bytes N] ...`
 
 Common filters / formatting:
 
@@ -162,6 +165,12 @@ addr
 # Explicit:
 addr ds_read  vgprLocalReadAddrA  --offset 0 --bytes 16
 addr ds_write vgprLocalWriteAddrB --offset 0 --bytes 16
+
+# Explicit (buffer_load, offen):
+addr buffer_load vgprGlobalReadOffsetA+0 --base sgprSrdA --soffset 0 --offset 0 --bytes 16
+
+# Explicit (buffer_store, offen):
+addr buffer_store v11 --base sgprSrdD --soffset 0 --offset 0 --bytes 16
 
 # Only show CU0, waves W2/W3, lanes 0-15:
 addr --cu 0 --wave 2-3 --lane 0-15

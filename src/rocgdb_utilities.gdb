@@ -10,9 +10,10 @@
 #       You can omit the leading '$' for register-like tokens (e.g. `reg sgprWorkGroup0`, `reg v192`).
 #       For SGPR/VGPR ($sgpr*/$vgpr*/$sN/$vN), default is decimal integer output (use --hex to override).
 #
-#   - addr [ds_read|ds_write] [<vaddr-expr>] [--offset N] [--bytes N] [--cu ID]... [--max-cu N]
-#           [--wave W|W0-W1|W0,W1,...] [--lane N|LO-HI] [--hex|--dec] [--out PATH] [--debug]
-#       Compute per-CU/per-wave/per-lane addresses for LDS ops at the current stop location.
+#   - addr [ds_read|ds_write|buffer_load|buffer_store] [<vaddr-expr>] [--base <sgprSrdBase>] [--soffset <expr>]
+#           [--offset N] [--bytes N] [--cu ID]... [--max-cu N] [--wave W|W0-W1|W0,W1,...]
+#           [--lane N|LO-HI] [--hex|--dec] [--out PATH] [--debug]
+#       Compute per-CU/per-wave/per-lane addresses for LDS/global ops at the current stop location.
 #       If stopped on a Tensile `.s` ds_read/ds_write line, you can run `addr` with no args.
 #
 #   - swcu <cu> [w]
@@ -1016,7 +1017,7 @@ SwCuCommand()
 
 #
 # Address helpers (per-CU / per-wave / per-lane)
-#   - addr [ds_read] [<vaddr-expr>] [--offset N] [--bytes N] [--cu ID]... [--max-cu N] [--wave ...] [--lane N|LO-HI] [--hex|--dec] [--out PATH]
+#   - addr [ds_read|ds_write|buffer_load|buffer_store] ...
 #
 
 def _strip_asm_comment(s: str) -> str:
@@ -1174,6 +1175,200 @@ def _parse_ds_write_asm_line(line: str):
     return {"opcode": op, "bytes": nbytes, "offset": off, "vaddr_expr": vaddr_expr}
 
 
+def _parse_buffer_load_asm_line(line: str):
+    """
+    Parse a Tensile asm line and extract basic buffer_load fields (offen form).
+
+    Example:
+      buffer_load_dwordx4 v[dst:dst+3], v[vaddr+0], s[sgprSrdA:sgprSrdA+3], 0 offen offset:0
+
+    Returns dict with keys:
+      - opcode: str
+      - bytes: int|None
+      - offset: int
+      - vaddr_expr: str|None
+      - base_lo: str        (sgpr base name/expression for SRD[0])
+      - base_hi: str        (sgpr base name/expression for SRD[1])
+      - soffset_expr: str   (soffset operand; "0" if immediate 0)
+      - offen: bool
+    """
+    s = _strip_asm_comment(line or "")
+    if not s:
+        return None
+
+    m = re.match(r"^\s*(?P<op>buffer_load[0-9A-Za-z_\.]*)\b", s)
+    if not m:
+        return None
+    op = m.group("op")
+
+    off = 0
+    mo = re.search(r"\boffset\s*:\s*(?P<imm>0x[0-9a-fA-F]+|-?\d+)\b", s)
+    if mo:
+        try:
+            off = int(mo.group("imm"), 0)
+        except Exception:
+            off = 0
+
+    # Size (bytes): dwordxN / dword
+    nbytes = None
+    # Note: opcode contains underscores, e.g. "buffer_load_dwordx4". "_" is a word char,
+    # so \b boundaries won't match before "dwordx4". Use a relaxed match.
+    mdx = re.search(r"dwordx(?P<n>\d+)", op)
+    if mdx:
+        try:
+            n = int(mdx.group("n"), 10)
+            if n > 0:
+                nbytes = 4 * n
+        except Exception:
+            nbytes = None
+    else:
+        # Match plain "..._dword" (and avoid matching "...dwordxN").
+        if re.search(r"(?:^|_)dword(?:$|_)", op) or ("dword" in op and "dwordx" not in op):
+            nbytes = 4
+
+    offen = (re.search(r"\boffen\b", s) is not None)
+
+    # Split operands:
+    #   0: "buffer_load... <dst>"
+    #   1: "<vaddr>" (offen)
+    #   2: "<srd>"
+    #   3: "<soffset> offen offset:..."
+    parts = [p.strip() for p in s.split(",")]
+    if len(parts) < 3:
+        return None
+
+    # vaddr operand (only meaningful if offen)
+    vaddr_expr = None
+    if offen and len(parts) >= 2:
+        vpart = parts[1].strip()
+        mva = re.match(r"^\s*v\[(?P<inner>.*)\]\s*$", vpart)
+        vaddr_expr = (mva.group("inner").strip() if mva else vpart)
+
+    # SRD operand: s[sgprSrdA:sgprSrdA+3] -> base_lo=sgprSrdA, base_hi=sgprSrdA+1
+    spart = parts[2].strip()
+    msa = re.match(r"^\s*s\[(?P<inner>.*)\]\s*$", spart)
+    inner = msa.group("inner").strip() if msa else spart
+    base0 = inner.split(":", 1)[0].strip()
+    if not base0:
+        return None
+    base_lo = base0
+    base_hi = f"{base0}+1"
+
+    soffset_expr = "0"
+    if len(parts) >= 4:
+        # take the first token before any keywords like offen/idxen/glc/slc/offset
+        p3 = parts[3]
+        p3 = re.split(r"\b(offen|idxen|glc|slc|dlc|l2|tfe|nt|offset)\b", p3, maxsplit=1)[0].strip()
+        if p3:
+            # might still contain extra tokens; take first whitespace-separated item
+            soffset_expr = p3.split()[0].strip()
+
+    return {
+        "opcode": op,
+        "bytes": nbytes,
+        "offset": off,
+        "vaddr_expr": vaddr_expr,
+        "base_lo": base_lo,
+        "base_hi": base_hi,
+        "soffset_expr": soffset_expr,
+        "offen": offen,
+    }
+
+
+def _parse_buffer_store_asm_line(line: str):
+    """
+    Parse a Tensile asm line and extract basic buffer_store fields (offen form).
+
+    Example:
+      buffer_store_dwordx4 v[16:19], v11, s[sgprSrdD:sgprSrdD+3], 0 offen offset:0 nt
+
+    Returns dict with keys (same as _parse_buffer_load_asm_line):
+      - opcode: str
+      - bytes: int|None
+      - offset: int
+      - vaddr_expr: str|None
+      - base_lo: str        (sgpr base name/expression for SRD[0])
+      - base_hi: str        (sgpr base name/expression for SRD[1])
+      - soffset_expr: str   (soffset operand; "0" if immediate 0)
+      - offen: bool
+    """
+    s = _strip_asm_comment(line or "")
+    if not s:
+        return None
+
+    m = re.match(r"^\s*(?P<op>buffer_store[0-9A-Za-z_\.]*)\b", s)
+    if not m:
+        return None
+    op = m.group("op")
+
+    off = 0
+    mo = re.search(r"\boffset\s*:\s*(?P<imm>0x[0-9a-fA-F]+|-?\d+)\b", s)
+    if mo:
+        try:
+            off = int(mo.group("imm"), 0)
+        except Exception:
+            off = 0
+
+    # Size (bytes): dwordxN / dword
+    nbytes = None
+    mdx = re.search(r"dwordx(?P<n>\d+)", op)
+    if mdx:
+        try:
+            n = int(mdx.group("n"), 10)
+            if n > 0:
+                nbytes = 4 * n
+        except Exception:
+            nbytes = None
+    else:
+        if re.search(r"(?:^|_)dword(?:$|_)", op) or ("dword" in op and "dwordx" not in op):
+            nbytes = 4
+
+    offen = (re.search(r"\boffen\b", s) is not None)
+
+    # Split operands:
+    #   0: "buffer_store... <data>"
+    #   1: "<vaddr>" (offen)
+    #   2: "<srd>"
+    #   3: "<soffset> offen offset:..."
+    parts = [p.strip() for p in s.split(",")]
+    if len(parts) < 3:
+        return None
+
+    vaddr_expr = None
+    if offen and len(parts) >= 2:
+        vpart = parts[1].strip()
+        mva = re.match(r"^\s*v\[(?P<inner>.*)\]\s*$", vpart)
+        vaddr_expr = (mva.group("inner").strip() if mva else vpart)
+
+    # SRD operand: s[sgprSrdD:sgprSrdD+3] -> base_lo=sgprSrdD, base_hi=sgprSrdD+1
+    spart = parts[2].strip()
+    msa = re.match(r"^\s*s\[(?P<inner>.*)\]\s*$", spart)
+    inner = msa.group("inner").strip() if msa else spart
+    base0 = inner.split(":", 1)[0].strip()
+    if not base0:
+        return None
+    base_lo = base0
+    base_hi = f"{base0}+1"
+
+    soffset_expr = "0"
+    if len(parts) >= 4:
+        p3 = parts[3]
+        p3 = re.split(r"\b(offen|idxen|glc|slc|dlc|l2|tfe|nt|offset)\b", p3, maxsplit=1)[0].strip()
+        if p3:
+            soffset_expr = p3.split()[0].strip()
+
+    return {
+        "opcode": op,
+        "bytes": nbytes,
+        "offset": off,
+        "vaddr_expr": vaddr_expr,
+        "base_lo": base_lo,
+        "base_hi": base_hi,
+        "soffset_expr": soffset_expr,
+        "offen": offen,
+    }
+
+
 def _addr_parse_wave_threads():
     """
     Parse `info threads` and return list[(tid:int, cu:int, slot:int, thread_obj)].
@@ -1241,14 +1436,34 @@ def _addr_format_u32(iv: int, out_hex: bool) -> str:
     return (f"0x{v:08x}" if out_hex else str(v))
 
 
+def _addr_format_u64(iv: int, out_hex: bool) -> str:
+    try:
+        v = int(iv) & ((1 << 64) - 1)
+    except Exception:
+        return "ERR"
+    return (f"0x{v:016x}" if out_hex else str(v))
+
+
+def _addr_eval_u32(expr: str) -> int:
+    """Evaluate an expression as u32 (best-effort)."""
+    v = gdb.parse_and_eval(expr)
+    ui = gdb.lookup_type("unsigned int")
+    try:
+        return int(v.cast(ui)) & 0xFFFFFFFF
+    except Exception:
+        return int(v) & 0xFFFFFFFF
+
+
 class AddrCommand(gdb.Command):
-    """addr [ds_read|ds_write] [<vaddr-expr>] [--offset N] [--bytes N] [--cu ID]... [--max-cu N] [--wave W|W0-W1|W0,W1,...] [--lane N|LO-HI] [--hex|--dec] [--out PATH] [--debug]
+    """addr [ds_read|ds_write|buffer_load|buffer_store] [<vaddr-expr>] [--base <sgprSrdBase>] [--soffset <expr>] [--offset N] [--bytes N] [--cu ID]... [--max-cu N] [--wave W|W0-W1|W0,W1,...] [--lane N|LO-HI] [--hex|--dec] [--out PATH] [--debug]
 
 Compute per-CU/per-wave/per-lane addresses for memory ops.
 
 Initial support:
   - ds_read: LDS read address = vaddr + offset (per lane)
   - ds_write: LDS write address = vaddr + offset (per lane)
+  - buffer_load (offen): global address = base64(srd[0:1]) + vaddr + soffset + offset
+  - buffer_store (offen): global address = base64(srd[0:1]) + vaddr + soffset + offset
 
 Common use:
   - stop at a ds_read_* line in a Tensile `.s`, then:
@@ -1279,6 +1494,8 @@ Common use:
         lane_hi = None
         off_override = None
         bytes_override = None
+        base_override = None
+        soffset_override = None
 
         def _dbg(msg: str):
             if debug:
@@ -1290,13 +1507,14 @@ Common use:
             if v not in picked:
                 picked.append(v)
 
-        # Parse subcommand / implicit ds_read from current source line.
+        # Parse subcommand / implicit asm-line inference.
         sub = None
         expr = None
         ds_meta = None
+        buf_meta = None
 
         # If first token is a known subcommand, consume it.
-        if argv and argv[0] in ("ds_read", "ds_write"):
+        if argv and argv[0] in ("ds_read", "ds_write", "buffer_load", "buffer_store"):
             sub = argv[0]
             argv = argv[1:]
 
@@ -1391,14 +1609,22 @@ Common use:
                     raise gdb.GdbError(f"addr: invalid --bytes value: {argv[i+1]}")
                 i += 2
                 continue
+            if a == "--base" and i + 1 < len(argv):
+                base_override = argv[i + 1]
+                i += 2
+                continue
+            if a == "--soffset" and i + 1 < len(argv):
+                soffset_override = argv[i + 1]
+                i += 2
+                continue
             raise gdb.GdbError(f"addr: unknown option: {a}")
 
-        # If no expr/subcommand, attempt to parse current asm line and infer ds_*.
+        # If no expr/subcommand, attempt to parse current asm line and infer ds_*/buffer_*.
         if sub is None and expr is None:
             fn, ln = _selected_source_location()
             if fn is None or ln is None:
-                wout.write("Usage: addr [ds_read|ds_write] [<vaddr-expr>] [--offset N] [--bytes N] [--cu ID]... [--max-cu N] [--wave ...] [--lane N|LO-HI] [--hex|--dec] [--out PATH]\n")
-                wout.write("Hint: stop in a Tensile `.s` ds_* line and run `addr`, or pass `addr ds_read|ds_write <vaddr-expr>`.\n")
+                wout.write("Usage: addr [ds_read|ds_write|buffer_load|buffer_store] [<vaddr-expr>] [--base <sgprSrdBase>] [--soffset <expr>] [--offset N] [--bytes N] [--cu ID]... [--max-cu N] [--wave ...] [--lane N|LO-HI] [--hex|--dec] [--out PATH]\n")
+                wout.write("Hint: stop in a Tensile `.s` ds_*/buffer_* line and run `addr`, or pass a subcommand explicitly.\n")
                 wout.close()
                 return
             src = _read_file_line_1based(fn, ln)
@@ -1412,10 +1638,20 @@ Common use:
                     sub = "ds_write"
                     expr = ds_meta["vaddr_expr"]
                 else:
-                    wout.write(f"addr: could not infer ds_read/ds_write from current line {fn}:{ln}\n")
-                    wout.write("Hint: use `addr ds_read|ds_write <vaddr-expr> --offset N --bytes N`.\n")
-                    wout.close()
-                    return
+                    buf_meta = _parse_buffer_load_asm_line(src or "")
+                    if buf_meta:
+                        sub = "buffer_load"
+                        expr = buf_meta.get("vaddr_expr")
+                    else:
+                        buf_meta = _parse_buffer_store_asm_line(src or "")
+                        if buf_meta:
+                            sub = "buffer_store"
+                            expr = buf_meta.get("vaddr_expr")
+                        else:
+                            wout.write(f"addr: could not infer ds_read/ds_write/buffer_load/buffer_store from current line {fn}:{ln}\n")
+                            wout.write("Hint: use `addr ds_read|ds_write <vaddr-expr> --offset N --bytes N` or `addr buffer_load|buffer_store <vaddr-expr> --base <sgprSrdBase>`.\n")
+                            wout.close()
+                            return
 
         # If user asked ds_read but didn't provide expr, try infer from current line.
         if sub == "ds_read" and expr is None:
@@ -1436,31 +1672,67 @@ Common use:
             expr = ds_meta["vaddr_expr"]
 
         if sub is None:
-            # Default to ds_read for now (future: buffer_*)
+            # Default to ds_read for now.
             sub = "ds_read"
 
-        if sub not in ("ds_read", "ds_write"):
+        if sub not in ("ds_read", "ds_write", "buffer_load", "buffer_store"):
             wout.close()
             raise gdb.GdbError(f"addr: unsupported subcommand: {sub}")
 
         # Finalize offset/bytes from inferred line (if any) and overrides.
-        if ds_meta is None:
+        if ds_meta is None and buf_meta is None:
             fn, ln = _selected_source_location()
             src = _read_file_line_1based(fn, ln) if fn and ln else None
             if src:
                 ds_meta = _parse_ds_read_asm_line(src or "")
                 if not ds_meta:
                     ds_meta = _parse_ds_write_asm_line(src or "")
+                if (not ds_meta) and (sub in ("buffer_load", "buffer_store")):
+                    buf_meta = _parse_buffer_load_asm_line(src or "") if sub == "buffer_load" else _parse_buffer_store_asm_line(src or "")
             else:
                 ds_meta = None
 
-        off = off_override if off_override is not None else (ds_meta["offset"] if ds_meta else 0)
-        nbytes = bytes_override if bytes_override is not None else (ds_meta["bytes"] if ds_meta else None)
-        opcode = ds_meta["opcode"] if (ds_meta and "opcode" in ds_meta) else "ds_read"
+        # Resolve common fields by subcommand.
+        if sub in ("ds_read", "ds_write"):
+            off = off_override if off_override is not None else (ds_meta["offset"] if ds_meta else 0)
+            nbytes = bytes_override if bytes_override is not None else (ds_meta["bytes"] if ds_meta else None)
+            opcode = ds_meta["opcode"] if (ds_meta and "opcode" in ds_meta) else sub
+            expr0 = _normalize_reg_expr(expr)
+            eval_expr = _rewrite_expr_via_autogen_map(expr0)
+            _dbg(f"sub={sub} expr={expr0} eval_expr={eval_expr} off={off} bytes={nbytes}")
+            # ds_* computes per-lane u32 LDS address.
+            addr_kind = "u32"
+        else:
+            # buffer_load/buffer_store: vaddr may be None if !offen
+            off = off_override if off_override is not None else (buf_meta["offset"] if buf_meta else 0)
+            nbytes = bytes_override if bytes_override is not None else (buf_meta["bytes"] if buf_meta else None)
+            opcode = buf_meta["opcode"] if (buf_meta and "opcode" in buf_meta) else sub
+            base_lo = base_override if base_override is not None else (buf_meta["base_lo"] if buf_meta else None)
+            base_hi = (f"{base_lo}+1" if base_lo is not None else None)
+            soffset_expr = soffset_override if soffset_override is not None else (buf_meta["soffset_expr"] if buf_meta else "0")
+            offen = bool(buf_meta.get("offen")) if buf_meta else False
 
-        expr0 = _normalize_reg_expr(expr)
-        eval_expr = _rewrite_expr_via_autogen_map(expr0)
-        _dbg(f"expr={expr0} eval_expr={eval_expr} off={off} bytes={nbytes}")
+            if base_lo is None:
+                raise gdb.GdbError(f"addr {sub}: need base SRD lo register (use --base <sgprSrdBase> or stop at a {sub}_* line).")
+
+            vaddr0 = None
+            eval_expr = None
+            if offen:
+                if expr is None:
+                    raise gdb.GdbError(f"addr {sub} (offen): need <vaddr-expr> or stop at a {sub}_* line.")
+                vaddr0 = _normalize_reg_expr(expr)
+                eval_expr = _rewrite_expr_via_autogen_map(vaddr0)
+
+            base_lo0 = _normalize_reg_expr(base_lo)
+            base_hi0 = _normalize_reg_expr(base_hi) if base_hi is not None else None
+            soff0 = _normalize_reg_expr(soffset_expr)
+            base_lo_eval = _rewrite_expr_via_autogen_map(base_lo0)
+            base_hi_eval = _rewrite_expr_via_autogen_map(base_hi0) if base_hi0 is not None else None
+            soff_eval = _rewrite_expr_via_autogen_map(soff0)
+
+            _dbg(f"sub={sub} offen={offen} vaddr={vaddr0} eval_vaddr={eval_expr} base_lo={base_lo0}->{base_lo_eval} base_hi={base_hi0}->{base_hi_eval} soff={soff0}->{soff_eval} off={off} bytes={nbytes}")
+
+            addr_kind = "u64"
 
         # Collect wave threads + map slots to W indices.
         entries = _addr_parse_wave_threads()
@@ -1512,7 +1784,7 @@ Common use:
         # Evaluate per thread and capture lane addresses.
         results = {}  # (cu,widx) -> ("LANES",(lines,lo,hi)) | ("CELL",str) | ("ERR",msg)
 
-        def _capture_addrs(v):
+        def _capture_addrs_ds(v):
             # Determine lane bounds
             if _is_array_value(v) and lane_idx is None:
                 try:
@@ -1526,7 +1798,7 @@ Common use:
                 else:
                     lo_use, hi_use = lo0, hi0
                 if hi_use < lo_use:
-                    return ("LANES", ([], lo_use, hi_use))
+                    return ("LANES", ([], lo_use, hi_use, 16))
                 parts = []
                 for i0 in range(lo_use, hi_use + 1):
                     try:
@@ -1542,7 +1814,7 @@ Common use:
                 per_line = 16
                 for base_i in range(0, len(parts), per_line):
                     lines.append(" ".join(parts[base_i:base_i + per_line]))
-                return ("LANES", (lines, lo_use, hi_use))
+                return ("LANES", (lines, lo_use, hi_use, per_line))
 
             # Scalar or lane-selected.
             try:
@@ -1551,6 +1823,54 @@ Common use:
                     return ("CELL", "ERR")
                 addr = (int(iv) + int(off)) & 0xFFFFFFFF
                 return ("CELL", _addr_format_u32(addr, out_hex))
+            except Exception:
+                return ("CELL", "ERR")
+
+        def _capture_addrs_buffer(vaddr_v, base_u64: int, soff_u32: int):
+            # vaddr_v may be None if !offen; treat as 0.
+            if vaddr_v is None:
+                vaddr_v = 0
+
+            if _is_array_value(vaddr_v) and lane_idx is None:
+                try:
+                    lo0, hi0 = vaddr_v.type.range()
+                    lo0, hi0 = int(lo0), int(hi0)
+                except Exception:
+                    lo0, hi0 = 0, -1
+                if lane_lo is not None and lane_hi is not None:
+                    lo_use = max(lo0, int(lane_lo))
+                    hi_use = min(hi0, int(lane_hi))
+                else:
+                    lo_use, hi_use = lo0, hi0
+                if hi_use < lo_use:
+                    return ("LANES", ([], lo_use, hi_use, 8))
+                parts = []
+                for i0 in range(lo_use, hi_use + 1):
+                    try:
+                        vv = _intish_value(vaddr_v[i0], lane_idx=None)
+                        if vv is None:
+                            parts.append("ERR")
+                        else:
+                            addr = (int(base_u64) + int(soff_u32) + int(off) + (int(vv) & 0xFFFFFFFF)) & ((1 << 64) - 1)
+                            parts.append(_addr_format_u64(addr, out_hex))
+                    except Exception:
+                        parts.append("ERR")
+                lines = []
+                per_line = 8  # 64-bit cells are wider
+                for base_i in range(0, len(parts), per_line):
+                    lines.append(" ".join(parts[base_i:base_i + per_line]))
+                return ("LANES", (lines, lo_use, hi_use, per_line))
+
+            # Scalar vaddr (or lane-selected)
+            try:
+                if _is_array_value(vaddr_v):
+                    vv = _intish_value(vaddr_v, lane_idx=lane_idx)
+                else:
+                    vv = _intish_value(vaddr_v, lane_idx=None)
+                if vv is None:
+                    return ("CELL", "ERR")
+                addr = (int(base_u64) + int(soff_u32) + int(off) + (int(vv) & 0xFFFFFFFF)) & ((1 << 64) - 1)
+                return ("CELL", _addr_format_u64(addr, out_hex))
             except Exception:
                 return ("CELL", "ERR")
 
@@ -1563,8 +1883,17 @@ Common use:
                         f.select()
                 except Exception:
                     pass
-                v = gdb.parse_and_eval(eval_expr)
-                results[(cu, widx)] = _capture_addrs(v)
+                if sub in ("ds_read", "ds_write"):
+                    v = gdb.parse_and_eval(eval_expr)
+                    results[(cu, widx)] = _capture_addrs_ds(v)
+                else:
+                    # Evaluate base64 and soffset as scalars
+                    lo_u32 = _addr_eval_u32(base_lo_eval)
+                    hi_u32 = _addr_eval_u32(base_hi_eval) if base_hi_eval is not None else 0
+                    base_u64 = (((hi_u32 & 0xFFFFFFFF) << 32) | (lo_u32 & 0xFFFFFFFF)) & ((1 << 64) - 1)
+                    soff_u32 = _addr_eval_u32(soff_eval)
+                    vv = (gdb.parse_and_eval(eval_expr) if eval_expr is not None else None)
+                    results[(cu, widx)] = _capture_addrs_buffer(vv, base_u64=base_u64, soff_u32=soff_u32)
             except (gdb.error, gdb.MemoryError) as e:
                 results[(cu, widx)] = ("ERR", str(e))
 
@@ -1578,7 +1907,11 @@ Common use:
         # Print header
         mode = "hex" if out_hex else "dec"
         bytes_s = str(nbytes) if nbytes is not None else "?"
-        wout.write(f"addr: {sub} {opcode} vaddr={expr0} offset={off} bytes={bytes_s} ({mode})\n")
+        if sub in ("ds_read", "ds_write"):
+            wout.write(f"addr: {sub} {opcode} vaddr={expr0} offset={off} bytes={bytes_s} ({mode})\n")
+        else:
+            vaddr_s = (vaddr0 if offen else "<offen=0>")
+            wout.write(f"addr: {sub} {opcode} base={base_lo0}:{base_hi0} vaddr={vaddr_s} soffset={soff0} offset={off} bytes={bytes_s} ({mode})\n")
         wout.write("CU  W   lanes\n")
         wout.write("--  --  -----\n")
 
@@ -1599,10 +1932,15 @@ Common use:
                     wout.write(f"{cu:<3d} W{w} {lane_tag} {payload}\n")
                     continue
                 if kind == "LANES":
-                    lines, lo0, hi0 = payload
+                    if isinstance(payload, tuple) and len(payload) == 4:
+                        lines, lo0, hi0, per_line = payload
+                    else:
+                        # backward-compat (older payloads)
+                        lines, lo0, hi0 = payload
+                        per_line = 16
                     for li, s in enumerate(lines):
-                        lo_lane = lo0 + li * 16
-                        hi_lane = min(lo_lane + 15, hi0)
+                        lo_lane = lo0 + li * int(per_line)
+                        hi_lane = min(lo_lane + int(per_line) - 1, hi0)
                         prefix = f"{cu:<3d} W{w}" if li == 0 else " " * 6
                         wout.write(f"{prefix} [{lo_lane:02d}-{hi_lane:02d}] {s}\n")
                     if not lines:
