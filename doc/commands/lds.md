@@ -3,7 +3,7 @@
 ### Syntax
 
 ```text
-lds <offset> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32] [--out PATH]
+lds <offset> [count] [hex|fp8|fp8e4m3fn|bf8|bf8e5m2|fp16|bf16|fp32] [--out PATH]
 ```
 
 Arguments:
@@ -19,7 +19,8 @@ Arguments:
 lds 0x200
 lds 0x200 64 fp8
 lds 0x200 64 fp8e4m3fn
-lds 0x200 64 fp8e5m2
+lds 0x200 64 bf8
+lds 0x200 64 bf8e5m2
 lds 0x200 64 fp16
 lds 0x0 256 bf16
 lds 0x100 32 fp32

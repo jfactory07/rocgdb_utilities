@@ -1955,9 +1955,9 @@ AddrCommand()
 
 #
 # Memory dump helpers (shared across kernels)
-#   - lds <offset> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32]
-#   - global <addr-expr> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32]
-#   - global <addr-lo-expr> <addr-hi-expr> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32]
+#   - lds <offset> [count] [hex|fp8|fp8e4m3fn|bf8|bf8e5m2|fp16|bf16|fp32]
+#   - global <addr-expr> [count] [hex|fp8|fp8e4m3fn|bf8|bf8e5m2|fp16|bf16|fp32]
+#   - global <addr-lo-expr> <addr-hi-expr> [count] [hex|fp8|fp8e4m3fn|bf8|bf8e5m2|fp16|bf16|fp32]
 #
 
 import struct
@@ -2075,7 +2075,8 @@ def _fp8_to_float(x, mode: str):
     mode = (mode or "").lower()
     if mode in ("fp8", "fp8e4m3", "fp8e4m3fn"):
         return _fp8_e4m3fn_to_float(x)
-    if mode in ("fp8e5m2",):
+    # fp8e5m2 is commonly referred to as bf8 (bfloat8) in some docs.
+    if mode in ("fp8e5m2", "bf8", "bf8e5m2"):
         return _fp8_e5m2_to_float(x)
     return float("nan")
 
@@ -2098,7 +2099,7 @@ def _fmt_float_cell(v, decimals=6):
 
 
 class _LdsCmd(gdb.Command):
-    """Dump LDS (local address space): lds <offset> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32] [--out PATH]"""
+    """Dump LDS (local address space): lds <offset> [count] [hex|fp8|fp8e4m3fn|bf8|bf8e5m2|fp16|bf16|fp32] [--out PATH]"""
 
     def __init__(self):
         # Use COMMAND_USER so it shows up under `help user-defined`.
@@ -2110,7 +2111,7 @@ class _LdsCmd(gdb.Command):
         wout = _TeeWriter(out_path)
         _refresh_autogen_map_if_needed()
         if len(argv) == 0:
-            wout.write("Usage: lds <offset> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32] [--out PATH]\n")
+            wout.write("Usage: lds <offset> [count] [hex|fp8|fp8e4m3fn|bf8|bf8e5m2|fp16|bf16|fp32] [--out PATH]\n")
             wout.close()
             return
 
@@ -2138,7 +2139,7 @@ class _LdsCmd(gdb.Command):
             wout.close()
             return
 
-        if fmt in ("fp8", "fp8e4m3fn", "fp8e5m2", "fp8e4m3"):
+        if fmt in ("fp8", "fp8e4m3fn", "fp8e4m3", "fp8e5m2", "bf8", "bf8e5m2"):
             bs, err = _mem_x_hex_values(f"x/{count}bx local#{offset}")
             if bs is None or len(bs) < count:
                 raise gdb.GdbError(f"Could not read {count} bytes from local#{offset}: {err}")
@@ -2172,13 +2173,13 @@ class _LdsCmd(gdb.Command):
             return
 
         wout.close()
-        raise gdb.GdbError(f"Unknown format: {fmt}. Use hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32")
+        raise gdb.GdbError(f"Unknown format: {fmt}. Use hex|fp8|fp8e4m3fn|bf8|bf8e5m2|fp16|bf16|fp32")
 
 
 class _GlobalCmd(gdb.Command):
     """Dump global/generic memory:
-  global <addr-expr> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32]
-  global <addr-lo-expr> <addr-hi-expr> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32]
+  global <addr-expr> [count] [hex|fp8|fp8e4m3fn|bf8|bf8e5m2|fp16|bf16|fp32]
+  global <addr-lo-expr> <addr-hi-expr> [count] [hex|fp8|fp8e4m3fn|bf8|bf8e5m2|fp16|bf16|fp32]
 """
 
     def __init__(self):
@@ -2191,8 +2192,8 @@ class _GlobalCmd(gdb.Command):
         wout = _TeeWriter(out_path)
         _refresh_autogen_map_if_needed()
         if len(argv) == 0:
-            wout.write("Usage: global <addr-expr> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32] [--out PATH]\n")
-            wout.write("   or: global <addr-lo-expr> <addr-hi-expr> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32] [--out PATH]\n")
+            wout.write("Usage: global <addr-expr> [count] [hex|fp8|fp8e4m3fn|bf8|bf8e5m2|fp16|bf16|fp32] [--out PATH]\n")
+            wout.write("   or: global <addr-lo-expr> <addr-hi-expr> [count] [hex|fp8|fp8e4m3fn|bf8|bf8e5m2|fp16|bf16|fp32] [--out PATH]\n")
             wout.close()
             return
 
@@ -2258,7 +2259,7 @@ class _GlobalCmd(gdb.Command):
             wout.close()
             return
 
-        if fmt in ("fp8", "fp8e4m3fn", "fp8e5m2", "fp8e4m3"):
+        if fmt in ("fp8", "fp8e4m3fn", "fp8e4m3", "fp8e5m2", "bf8", "bf8e5m2"):
             bs, _used, err = _mem_x_hex_values_try([f"x/{count}bx {addr_for_x}", f"x/{count}bx {addr_for_x_fallback}"])
             if bs is None or len(bs) < count:
                 raise gdb.GdbError(f"Cannot access global memory at {addr_for_x} (value {addr_u64:#x}): {err}")
@@ -2292,7 +2293,7 @@ class _GlobalCmd(gdb.Command):
             return
 
         wout.close()
-        raise gdb.GdbError(f"Unknown format: {fmt}. Use hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32")
+        raise gdb.GdbError(f"Unknown format: {fmt}. Use hex|fp8|fp8e4m3fn|bf8|bf8e5m2|fp16|bf16|fp32")
 
 
 _LdsCmd()
