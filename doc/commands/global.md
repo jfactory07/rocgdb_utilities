@@ -5,8 +5,8 @@
 Two forms:
 
 ```text
-global <addr-expr> [count] [hex|fp16|bf16|fp32] [--out PATH]
-global <addr-lo-expr> <addr-hi-expr> [count] [hex|fp16|bf16|fp32] [--out PATH]
+global <addr-expr> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32] [--out PATH]
+global <addr-lo-expr> <addr-hi-expr> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32] [--out PATH]
 ```
 
 Notes:
@@ -19,6 +19,9 @@ Notes:
 
 ```gdb
 global $sgprAddressB
+global $sgprAddressB 64 fp8
+global $sgprAddressB 64 fp8e4m3fn
+global $sgprAddressB 64 fp8e5m2
 global $sgprAddressB 64 fp16
 global $sgprAddressB 16 fp32
 global $sgprAddressB_0 $sgprAddressB_1 16 fp32

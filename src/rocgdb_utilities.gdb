@@ -1955,9 +1955,9 @@ AddrCommand()
 
 #
 # Memory dump helpers (shared across kernels)
-#   - lds <offset> [count] [hex|fp16|bf16|fp32]
-#   - global <addr-expr> [count] [hex|fp16|bf16|fp32]
-#   - global <addr-lo-expr> <addr-hi-expr> [count] [hex|fp16|bf16|fp32]
+#   - lds <offset> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32]
+#   - global <addr-expr> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32]
+#   - global <addr-lo-expr> <addr-hi-expr> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32]
 #
 
 import struct
@@ -2027,6 +2027,59 @@ def _bf16_to_float(b):
     return struct.unpack("<f", struct.pack("<I", u))[0]
 
 
+def _fp8_e4m3fn_to_float(x):
+    """
+    Decode FP8 E4M3FN (finite numbers) into float.
+    sign:1, exp:4 (bias 7), mant:3. exp=0xF is treated as NaN (no infinities in FN).
+    """
+    b = int(x) & 0xFF
+    s = (b >> 7) & 0x1
+    e = (b >> 3) & 0xF
+    m = b & 0x7
+    sign = -1.0 if s else 1.0
+    bias = 7
+    if e == 0:
+        if m == 0:
+            return -0.0 if s else 0.0
+        # subnormal: 2^(1-bias) * (m/2^3)
+        return sign * (2.0 ** (1 - bias)) * (float(m) / 8.0)
+    if e == 0xF:
+        return float("nan")
+    return sign * (2.0 ** (int(e) - bias)) * (1.0 + float(m) / 8.0)
+
+
+def _fp8_e5m2_to_float(x):
+    """
+    Decode FP8 E5M2 into float.
+    sign:1, exp:5 (bias 15), mant:2. exp=0x1F: inf/NaN.
+    """
+    b = int(x) & 0xFF
+    s = (b >> 7) & 0x1
+    e = (b >> 2) & 0x1F
+    m = b & 0x3
+    sign = -1.0 if s else 1.0
+    bias = 15
+    if e == 0:
+        if m == 0:
+            return -0.0 if s else 0.0
+        # subnormal: 2^(1-bias) * (m/2^2)
+        return sign * (2.0 ** (1 - bias)) * (float(m) / 4.0)
+    if e == 0x1F:
+        if m == 0:
+            return float("-inf") if s else float("inf")
+        return float("nan")
+    return sign * (2.0 ** (int(e) - bias)) * (1.0 + float(m) / 4.0)
+
+
+def _fp8_to_float(x, mode: str):
+    mode = (mode or "").lower()
+    if mode in ("fp8", "fp8e4m3", "fp8e4m3fn"):
+        return _fp8_e4m3fn_to_float(x)
+    if mode in ("fp8e5m2",):
+        return _fp8_e5m2_to_float(x)
+    return float("nan")
+
+
 def _fmt_float_cell(v, decimals=6):
     # Fixed decimals + reserved sign column (aligns columns visually)
     try:
@@ -2045,7 +2098,7 @@ def _fmt_float_cell(v, decimals=6):
 
 
 class _LdsCmd(gdb.Command):
-    """Dump LDS (local address space): lds <offset> [count] [hex|fp16|bf16|fp32] [--out PATH]"""
+    """Dump LDS (local address space): lds <offset> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32] [--out PATH]"""
 
     def __init__(self):
         # Use COMMAND_USER so it shows up under `help user-defined`.
@@ -2057,7 +2110,7 @@ class _LdsCmd(gdb.Command):
         wout = _TeeWriter(out_path)
         _refresh_autogen_map_if_needed()
         if len(argv) == 0:
-            wout.write("Usage: lds <offset> [count] [hex|fp16|bf16|fp32] [--out PATH]\n")
+            wout.write("Usage: lds <offset> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32] [--out PATH]\n")
             wout.close()
             return
 
@@ -2085,6 +2138,22 @@ class _LdsCmd(gdb.Command):
             wout.close()
             return
 
+        if fmt in ("fp8", "fp8e4m3fn", "fp8e5m2", "fp8e4m3"):
+            bs, err = _mem_x_hex_values(f"x/{count}bx local#{offset}")
+            if bs is None or len(bs) < count:
+                raise gdb.GdbError(f"Could not read {count} bytes from local#{offset}: {err}")
+            bs = [b & 0xFF for b in bs[:count]]
+            vals = [_fp8_to_float(b, fmt) for b in bs]
+            per_line = 16
+            decimals = 3
+            for base in range(0, len(vals), per_line):
+                chunk = vals[base : base + per_line]
+                cells = [_fmt_float_cell(v, decimals=decimals) for v in chunk]
+                w = max(len(c) for c in cells) if cells else 0
+                wout.write(f"[{base:4d}-{base+len(chunk)-1:4d}] " + "  ".join(c.ljust(w) for c in cells) + "\n")
+            wout.close()
+            return
+
         if fmt in ("fp16", "bf16"):
             hs, err = _mem_x_hex_values(f"x/{count}hx local#{offset}")
             if hs is None or len(hs) < count:
@@ -2103,13 +2172,13 @@ class _LdsCmd(gdb.Command):
             return
 
         wout.close()
-        raise gdb.GdbError(f"Unknown format: {fmt}. Use hex|fp16|bf16|fp32")
+        raise gdb.GdbError(f"Unknown format: {fmt}. Use hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32")
 
 
 class _GlobalCmd(gdb.Command):
     """Dump global/generic memory:
-  global <addr-expr> [count] [hex|fp16|bf16|fp32]
-  global <addr-lo-expr> <addr-hi-expr> [count] [hex|fp16|bf16|fp32]
+  global <addr-expr> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32]
+  global <addr-lo-expr> <addr-hi-expr> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32]
 """
 
     def __init__(self):
@@ -2122,8 +2191,8 @@ class _GlobalCmd(gdb.Command):
         wout = _TeeWriter(out_path)
         _refresh_autogen_map_if_needed()
         if len(argv) == 0:
-            wout.write("Usage: global <addr-expr> [count] [hex|fp16|bf16|fp32] [--out PATH]\n")
-            wout.write("   or: global <addr-lo-expr> <addr-hi-expr> [count] [hex|fp16|bf16|fp32] [--out PATH]\n")
+            wout.write("Usage: global <addr-expr> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32] [--out PATH]\n")
+            wout.write("   or: global <addr-lo-expr> <addr-hi-expr> [count] [hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32] [--out PATH]\n")
             wout.close()
             return
 
@@ -2189,6 +2258,22 @@ class _GlobalCmd(gdb.Command):
             wout.close()
             return
 
+        if fmt in ("fp8", "fp8e4m3fn", "fp8e5m2", "fp8e4m3"):
+            bs, _used, err = _mem_x_hex_values_try([f"x/{count}bx {addr_for_x}", f"x/{count}bx {addr_for_x_fallback}"])
+            if bs is None or len(bs) < count:
+                raise gdb.GdbError(f"Cannot access global memory at {addr_for_x} (value {addr_u64:#x}): {err}")
+            bs = [b & 0xFF for b in bs[:count]]
+            vals = [_fp8_to_float(b, fmt) for b in bs]
+            per_line = 16
+            decimals = 3
+            for base in range(0, len(vals), per_line):
+                chunk = vals[base : base + per_line]
+                cells = [_fmt_float_cell(v, decimals=decimals) for v in chunk]
+                w = max(len(c) for c in cells) if cells else 0
+                wout.write(f"[{base:4d}-{base+len(chunk)-1:4d}] " + "  ".join(c.ljust(w) for c in cells) + "\n")
+            wout.close()
+            return
+
         if fmt in ("fp16", "bf16"):
             hs, _used, err = _mem_x_hex_values_try([f"x/{count}hx {addr_for_x}", f"x/{count}hx {addr_for_x_fallback}"])
             if hs is None or len(hs) < count:
@@ -2207,7 +2292,7 @@ class _GlobalCmd(gdb.Command):
             return
 
         wout.close()
-        raise gdb.GdbError(f"Unknown format: {fmt}. Use hex|fp16|bf16|fp32")
+        raise gdb.GdbError(f"Unknown format: {fmt}. Use hex|fp8|fp8e4m3fn|fp8e5m2|fp16|bf16|fp32")
 
 
 _LdsCmd()
