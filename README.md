@@ -53,7 +53,7 @@ List of commands:
 addr -- addr [ds_read|ds_write|buffer_load|buffer_store] [<vaddr-expr>] [--base <sgprSrdBase>] [--soffset <expr>] [--offset N] [--bytes N] [--cu ID]... [--max-cu N] [--wave W|W0-W1|W0,W1,...] [--lane N|LO-HI] [--hex|--dec] [--out PATH] [--debug]
 global -- Dump global/generic memory:
 lds -- Dump LDS (local address space): lds <offset> [count] [hex|fp16|bf16|fp32] [--out PATH]
-reg -- reg <expr> [--max-cu N] [--cu ID]... [--wave W|W0-W1|W0,W1,...] [--hex|--dec] [--fp16|--bf16|--fp32] [--lane N] [--show-err]
+reg -- reg <expr...> [--max-cu N] [--cu ID]... [--wave W|W0-W1|W0,W1,...] [--hex|--dec] [--signed] [--fp16|--bf16|--fp32] [--lane N|LO-HI] [--show-err]
 roc_autogen -- Auto-generate and source per-kernel convenience variables based on current asm stop location.
 roc_autogen_enable -- Enable auto-generation by running roc_autogen on every stop (via gdb.events.stop).
 roc_update -- User-defined.

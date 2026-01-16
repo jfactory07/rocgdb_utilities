@@ -4,11 +4,12 @@
 #   (gdb) source rocgdb_utilities/src/rocgdb_utilities.gdb
 #
 # Commands provided:
-#   - reg <expr> [--max-cu N] [--cu ID]... [--hex|--dec] [--fp16|--bf16|--fp32] [--lane N] [--show-err]
-#           [--debug] [--escape] [--out PATH]
+#   - reg <expr...> [--max-cu N] [--cu ID]... [--wave W|W0-W1|W0,W1,...] [--hex|--dec] [--signed]
+#           [--fp16|--bf16|--fp32] [--lane N|LO-HI] [--show-err] [--debug] [--escape] [--out PATH]
 #       Dump register values in a CU/wave table. For VGPRs, default prints all lanes (16 per line).
 #       You can omit the leading '$' for register-like tokens (e.g. `reg sgprWorkGroup0`, `reg v192`).
 #       For SGPR/VGPR ($sgpr*/$vgpr*/$sN/$vN), default is decimal integer output (use --hex to override).
+#       Use --signed to print decimal values as signed int32 (useful for negative offsets).
 #
 #   - addr [ds_read|ds_write|buffer_load|buffer_store] [<vaddr-expr>] [--base <sgprSrdBase>] [--soffset <expr>]
 #           [--offset N] [--bytes N] [--cu ID]... [--max-cu N] [--wave W|W0-W1|W0,W1,...]
@@ -78,17 +79,18 @@ def _rewrite_expr_via_autogen_map(expr: str) -> str:
     per-thread (not a snapshot convenience var).
     """
     try:
-        if not expr or not expr.startswith("$"):
+        if not expr:
             return expr
         sym2reg = getattr(gdb, "_roc_autogen_sym2reg", None)
         if not isinstance(sym2reg, dict):
             return expr
 
-        # Support register-index expressions like:
-        #   $sgprSrdA+1  -> $s{base+1}  (maps to sgprSrdA_1)
-        #   $vgprFoo+12  -> $v{base+12}
-        m = re.match(r"^\$(?P<name>(?:sgpr|vgpr)[A-Za-z_][A-Za-z0-9_]*)\s*\+\s*(?P<off>0x[0-9a-fA-F]+|\d+)\s*$", expr)
-        if m:
+        # Rewrite occurrences inside larger expressions too.
+        #
+        # 1) Support register-index expressions like:
+        #    $sgprSrdA+1  -> $s{base+1}  (maps to sgprSrdA_1)
+        #    $vgprFoo+12  -> $v{base+12}
+        def _repl_plus(m):
             base_name = m.group("name")
             off = int(m.group("off"), 0)
             kv0 = sym2reg.get(base_name)
@@ -98,17 +100,33 @@ def _rewrite_expr_via_autogen_map(expr: str) -> str:
                     return f"$s{idx0 + off}"
                 if kind0 == "v":
                     return f"$v{idx0 + off}"
+            return m.group(0)
 
-        key = expr[1:]
-        kv = sym2reg.get(key)
-        if not kv or len(kv) != 2:
-            return expr
-        kind, idx = kv[0], int(kv[1])
-        if kind == "s":
-            return f"$s{idx}"
-        if kind == "v":
-            return f"$v{idx}"
-        return expr
+        expr2 = re.sub(
+            r"\$(?P<name>(?:sgpr|vgpr)[A-Za-z_][A-Za-z0-9_]*)\s*\+\s*(?P<off>0x[0-9a-fA-F]+|\d+)",
+            _repl_plus,
+            expr,
+        )
+
+        # 2) Rewrite plain $sgprFoo/$vgprBar[_K] occurrences.
+        def _repl_plain(m):
+            key = m.group("name")
+            kv = sym2reg.get(key)
+            if not kv or len(kv) != 2:
+                return m.group(0)
+            kind, idx = kv[0], int(kv[1])
+            if kind == "s":
+                return f"$s{idx}"
+            if kind == "v":
+                return f"$v{idx}"
+            return m.group(0)
+
+        expr3 = re.sub(
+            r"\$(?P<name>(?:sgpr|vgpr)[A-Za-z_][A-Za-z0-9_]*(?:_[0-9]+)?)\b",
+            _repl_plain,
+            expr2,
+        )
+        return expr3
     except Exception:
         return expr
 
@@ -124,19 +142,43 @@ def _normalize_reg_expr(expr: str) -> str:
     try:
         if not expr:
             return expr
-        if expr.startswith("$"):
-            return expr
 
         # If autogen map is present, accept bare symbol names.
         sym2reg = getattr(gdb, "_roc_autogen_sym2reg", None)
-        if isinstance(sym2reg, dict) and expr in sym2reg:
-            return "$" + expr
+        has_sym2reg = isinstance(sym2reg, dict) and bool(sym2reg)
 
-        if re.match(r"^(sgpr|vgpr)[A-Za-z_][A-Za-z0-9_]*(?:_[0-9]+)?(?:\s*\+\s*(?:0x[0-9a-fA-F]+|\d+))?$", expr):
-            return "$" + expr
-        if re.match(r"^[sv][0-9]+$", expr):
-            return "$" + expr
-        return expr
+        # Fast-path: common single-token cases (preserve old behavior).
+        # Only use this path when the string looks like a single identifier/register token,
+        # not a composite expression (which might be written without spaces).
+        looks_like_expr = re.search(r"[+\-*/%&|^~()<>\[\]]", expr) is not None
+        if (not any(ch.isspace() for ch in expr)) and (not looks_like_expr):
+            if expr.startswith("$"):
+                return expr
+            if has_sym2reg and expr in sym2reg:
+                return "$" + expr
+            if re.match(r"^(sgpr|vgpr)[A-Za-z_][A-Za-z0-9_]*(?:_[0-9]+)?(?:\s*\+\s*(?:0x[0-9a-fA-F]+|\d+))?$", expr):
+                return "$" + expr
+            if re.match(r"^[sv][0-9]+$", expr):
+                return "$" + expr
+            return expr
+
+        # General case: allow expressions like `v13 - v16`, `(v0 & 0xff)`, `sgprFoo + 4`.
+        # Prefix bare register-like identifiers with '$' when they are not already prefixed.
+        out = expr
+        out = re.sub(r"(?<![\w$])([sv][0-9]+)(?![\w])", r"$\1", out)
+        out = re.sub(r"(?<![\w$])((?:sgpr|vgpr)[A-Za-z_][A-Za-z0-9_]*(?:_[0-9]+)?)(?![\w])", r"$\1", out)
+
+        if has_sym2reg:
+            # Rewrite any bare autogen symbol occurrences (conservatively: whole identifiers only).
+            def _repl_autogen(m):
+                name = m.group(1)
+                if name in sym2reg:
+                    return "$" + name
+                return name
+
+            out = re.sub(r"(?<![\w$])([A-Za-z_][A-Za-z0-9_]*)(?![\w])", _repl_autogen, out)
+
+        return out
     except Exception:
         return expr
 
@@ -229,7 +271,7 @@ class _TeeWriter:
             pass
 
 
-def _u32_to_str(iv, out_hex, float_mode):
+def _u32_to_str(iv, out_hex, float_mode, signed=False):
     """
     Format a 32-bit register value.
 
@@ -243,7 +285,13 @@ def _u32_to_str(iv, out_hex, float_mode):
         return "ERR"
     iv = int(iv) & 0xFFFFFFFF
     if float_mode is None:
-        return (f"0x{iv:08x}" if out_hex else str(iv))
+        if out_hex:
+            return f"0x{iv:08x}"
+        if signed:
+            # Interpret as signed int32 for more natural offset printing.
+            if iv & 0x80000000:
+                iv = iv - 0x100000000
+        return str(iv)
 
     # Float formatting uses fixed decimals + reserved sign column via _fmt_float_cell (defined later).
     if float_mode == "fp32":
@@ -263,7 +311,7 @@ def _u32_to_str(iv, out_hex, float_mode):
     return "ERR"
 
 
-def _format_lanes_chunks_u32(v, out_hex=True, per_line=16, float_mode=None):
+def _format_lanes_chunks_u32(v, out_hex=True, per_line=16, float_mode=None, signed=False):
     """Format a VGPR vector (array) as multiple lines, `per_line` lanes per line."""
     try:
         lo, hi = v.type.range()
@@ -274,7 +322,7 @@ def _format_lanes_chunks_u32(v, out_hex=True, per_line=16, float_mode=None):
     parts = []
     for i in range(lo, hi + 1):
         try:
-            parts.append(_u32_to_str(_intish_value(v[i], lane_idx=None), out_hex=out_hex, float_mode=float_mode))
+            parts.append(_u32_to_str(_intish_value(v[i], lane_idx=None), out_hex=out_hex, float_mode=float_mode, signed=signed))
         except Exception:
             parts.append("ERR")
 
@@ -284,7 +332,7 @@ def _format_lanes_chunks_u32(v, out_hex=True, per_line=16, float_mode=None):
     return chunks
 
 
-def _format_lanes_range_u32(v, lane_lo, lane_hi, out_hex=True, per_line=16, float_mode=None):
+def _format_lanes_range_u32(v, lane_lo, lane_hi, out_hex=True, per_line=16, float_mode=None, signed=False):
     """Format lanes [lane_lo..lane_hi] (inclusive) as multiple lines, `per_line` lanes per line."""
     try:
         lo, hi = v.type.range()
@@ -300,7 +348,7 @@ def _format_lanes_range_u32(v, lane_lo, lane_hi, out_hex=True, per_line=16, floa
     parts = []
     for i in range(lo, hi + 1):
         try:
-            parts.append(_u32_to_str(_intish_value(v[i], lane_idx=None), out_hex=out_hex, float_mode=float_mode))
+            parts.append(_u32_to_str(_intish_value(v[i], lane_idx=None), out_hex=out_hex, float_mode=float_mode, signed=signed))
         except Exception:
             parts.append("ERR")
 
@@ -398,7 +446,7 @@ def _format_lanes_chunks(v, out_hex=True, per_line=16):
 
 
 class RegCommand(gdb.Command):
-    """reg <expr> [--max-cu N] [--cu ID]... [--wave W|W0-W1|W0,W1,...] [--hex|--dec] [--fp16|--bf16|--fp32] [--lane N] [--show-err]
+    """reg <expr> [--max-cu N] [--cu ID]... [--wave W|W0-W1|W0,W1,...] [--hex|--dec] [--signed] [--fp16|--bf16|--fp32] [--lane N] [--show-err]
        reg --map
 
 Print a 4-column grid. Each row corresponds to one CU, and each column is one wave.
@@ -415,7 +463,7 @@ This uses thread ordering as a proxy for CU assignment:
         out_path, argv = _parse_out_arg(argv)
         wout = _TeeWriter(out_path)
         if not argv:
-            wout.write("Usage: reg <expr> [--max-cu N] [--cu ID]... [--wave W|W0-W1|W0,W1,...] [--hex|--dec] [--fp16|--bf16|--fp32] [--lane N] [--show-err] [--debug] [--escape] [--out PATH]\n")
+            wout.write("Usage: reg <expr> [--max-cu N] [--cu ID]... [--wave W|W0-W1|W0,W1,...] [--hex|--dec] [--signed] [--fp16|--bf16|--fp32] [--lane N] [--show-err] [--debug] [--escape] [--out PATH]\n")
             wout.write("       reg --map [--out PATH]\n")
             wout.close()
             return
@@ -457,7 +505,18 @@ This uses thread ordering as a proxy for CU assignment:
             wout.close()
             return
 
-        expr = _normalize_reg_expr(argv[0])
+        # Support expressions spanning multiple argv tokens, e.g.:
+        #   reg v13 - v16 --dec
+        # Everything up to the first `--option` token is treated as the expression.
+        expr_tokens = []
+        j = 0
+        while j < len(argv) and not str(argv[j]).startswith("--"):
+            expr_tokens.append(argv[j])
+            j += 1
+        if not expr_tokens:
+            raise gdb.GdbError("reg: missing expression (expected: reg <expr> [--options...])")
+        expr = _normalize_reg_expr(" ".join(expr_tokens))
+        argv = [expr] + argv[j:]
         eval_expr = _rewrite_expr_via_autogen_map(expr)
         max_cu = None
         cu_filter = []  # list[int], if non-empty only show these CUs (in given order)
@@ -467,6 +526,8 @@ This uses thread ordering as a proxy for CU assignment:
         is_reg_like = (
             re.match(r"^\$(?:[sv]\d+)$", eval_expr) is not None
             or re.match(r"^\$(?:sgpr|vgpr)[A-Za-z_][A-Za-z0-9_]*(?:_[0-9]+)?$", expr) is not None
+            or re.search(r"\$(?:[sv]\d+)\b", eval_expr) is not None
+            or re.search(r"\$(?:sgpr|vgpr)[A-Za-z_]", expr) is not None
         )
         out_hex = (not is_reg_like)
         # If expr is a VGPR (vector register), default is to print ALL lanes.
@@ -478,6 +539,7 @@ This uses thread ordering as a proxy for CU assignment:
         debug = False
         escape = False
         float_mode = None
+        signed = False
         wave_cols = [0, 1, 2, 3]  # which wave columns to print (W0..W3)
 
         i = 1
@@ -503,6 +565,10 @@ This uses thread ordering as a proxy for CU assignment:
                 continue
             if a == "--dec":
                 out_hex = False
+                i += 1
+                continue
+            if a == "--signed":
+                signed = True
                 i += 1
                 continue
             if a == "--fp16":
@@ -600,7 +666,7 @@ This uses thread ordering as a proxy for CU assignment:
             try:
                 if lane_idx is None and _is_array_value(v):
                     if lane_lo is not None and lane_hi is not None:
-                        lines, lo, hi = _format_lanes_range_u32(v, lane_lo, lane_hi, out_hex=out_hex, per_line=16, float_mode=float_mode)
+                        lines, lo, hi = _format_lanes_range_u32(v, lane_lo, lane_hi, out_hex=out_hex, per_line=16, float_mode=float_mode, signed=signed)
                         return ("LANES", (lines, lo, hi))
                     # full lanes
                     try:
@@ -608,12 +674,12 @@ This uses thread ordering as a proxy for CU assignment:
                         lo0, hi0 = int(lo0), int(hi0)
                     except Exception:
                         lo0, hi0 = 0, -1
-                    return ("LANES", (_format_lanes_chunks_u32(v, out_hex=out_hex, per_line=16, float_mode=float_mode), lo0, hi0))
+                    return ("LANES", (_format_lanes_chunks_u32(v, out_hex=out_hex, per_line=16, float_mode=float_mode, signed=signed), lo0, hi0))
             except Exception:
                 # Fall through to scalar formatting
                 pass
             iv = _intish_value(v, lane_idx=lane_idx)
-            return ("CELL", _u32_to_str(iv, out_hex=out_hex, float_mode=float_mode))
+            return ("CELL", _u32_to_str(iv, out_hex=out_hex, float_mode=float_mode, signed=signed))
 
         def _dbg(msg: str):
             if debug:
